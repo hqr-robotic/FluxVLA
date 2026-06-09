@@ -606,13 +606,23 @@ class OpenVLA(BaseVLA):
         Returns:
             torch.FloatTensor: The predicted action logits.
         """
-        output = self.generate(
-            lang_tokens,
-            images,
-            max_new_tokens=self.get_action_dim(unnorm_key) + 1,
-            **kwargs)
+        if not torch.all(lang_tokens[:, -1] == 29871):
+            empty_token = torch.full((lang_tokens.shape[0], 1),
+                                     29871,
+                                     dtype=lang_tokens.dtype,
+                                     device=lang_tokens.device)
+            lang_tokens = torch.cat((lang_tokens, empty_token), dim=1)
+            if lang_masks is not None:
+                empty_mask = torch.ones((lang_masks.shape[0], 1),
+                                        dtype=lang_masks.dtype,
+                                        device=lang_masks.device)
+                lang_masks = torch.cat((lang_masks, empty_mask), dim=1)
 
-        action_preds = output[:, -self.get_action_dim(unnorm_key) - 1:-1]
+        action_dim = self.get_action_dim(unnorm_key)
+        output = self.generate(
+            lang_tokens, images, max_new_tokens=action_dim, **kwargs)
+
+        action_preds = output[:, -action_dim:]
 
         # action_preds = action_preds[:, ~lang_masks.squeeze(0)[1:]]
         # action_preds = action_preds[:, :7]
@@ -628,21 +638,32 @@ class OpenVLA(BaseVLA):
         if unnorm_key is None:
             assert len(norm_stats) == 1, (
                 f'Your model was trained on more than one dataset, '
-                f'please pass a `unnorm_key` from the following options to'
-                f'choose the statistics'
+                f'please pass an unnorm_key from the following options to '
+                f'choose the statistics '
                 f'used for un-normalizing actions: {norm_stats.keys()}')
             unnorm_key = next(iter(norm_stats.keys()))
 
         assert unnorm_key in norm_stats, (
-            f'The `unnorm_key` you chose is not in'
-            f'the set of available dataset statistics,'
+            f'The unnorm_key you chose is unavailable in '
+            f'the set of dataset statistics. '
             f'please choose from: {norm_stats.keys()}')
         return unnorm_key
 
     def get_action_dim(self, unnorm_key: Optional[str] = None) -> int:
         """Get the dimensionality of the policy's action space."""
         unnorm_key = self._check_unnorm_key(self.norm_stats, unnorm_key)
-        return len(self.norm_stats[unnorm_key]['action']['q01'])
+        return self._get_action_dim_from_stats(
+            self.norm_stats[unnorm_key]['action'])
+
+    @staticmethod
+    def _get_action_dim_from_stats(action_stats: Dict[str, Any]) -> int:
+        for key in ('q01', 'min', 'mean', 'max', 'std'):
+            value = action_stats.get(key)
+            if value is not None:
+                return len(value)
+        raise KeyError(
+            'Unable to infer action dimension from normalization stats. '
+            "Expected one of: 'q01', 'min', 'mean', 'max', or 'std'.")
 
     def prepare_inputs_for_generation(
         self,

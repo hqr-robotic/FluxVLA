@@ -41,6 +41,8 @@ FluxVLA Engine是面向具身智能落地应用的全链路一体化工程平台
 
 ## 📢 最新动态
 
+**\[2026/06/04\]** 🔥 现已支持 Pi0.5-RTC 的 Triton 后端，详见 [inference_acceleration](docs/inference_acceleration.md)。
+
 **\[2026/05/28\]** 🔥 正式发布面向双臂操作的模型解耦 DAgger 流水线 [FluxDAgger](https://github.com/FluxVLA/FluxDAgger)，便于接入不同 VLA 与奖励模型。
 
 **\[2026/05/28\]** 🔥 正式发布具身操作仿真 Benchmark [FluxBisim](https://github.com/FluxVLA/FluxBisim)。
@@ -254,7 +256,6 @@ tensorboard --logdir work_dirs/tensorboard
 | libero-spatial         | [limxdynamics/FluxVLAData/libero_spatial_no_noops_lerobotv2.1](https://huggingface.co/datasets/limxdynamics/FluxVLAData/tree/main/libero_spatial_no_noops_lerobotv2.1) |
 | libero-10              | [limxdynamics/FluxVLAData/libero_10_no_noops_lerobotv2.1](https://huggingface.co/datasets/limxdynamics/FluxVLAData/tree/main/libero_10_no_noops_lerobotv2.1)           |
 | libero-goal            | [limxdynamics/FluxVLAData/libero_goal_no_noops_lerobotv2.1](https://huggingface.co/datasets/limxdynamics/FluxVLAData/tree/main/libero_goal_no_noops_lerobotv2.1)       |
-| modified_libero_rlds   | [openvla/modified_libero_rlds](https://huggingface.co/datasets/openvla/modified_libero_rlds)                                                                           |
 | RealRobot_AgileX_aloha | [limxdynamics/FluxVLAData/RealRobot_AgileX_aloha_lerobot_v2](https://huggingface.co/datasets/limxdynamics/FluxVLAData/tree/main/RealRobot_AgileX_aloha_lerobot_v2)     |
 | RealRobot_UR3_Chem     | [limxdynamics/FluxVLAData/RealRobot_UR3_Chem_lerobot_v2](https://huggingface.co/datasets/limxdynamics/FluxVLAData/tree/main/RealRobot_UR3_Chem_lerobot_v2)             |
 
@@ -358,7 +359,7 @@ huggingface-cli download limxdynamics/FluxVLAData --repo-type dataset --include 
 | 模型        | 大小 | 下载链接                                                                                   |
 | ----------- | ---- | ------------------------------------------------------------------------------------------ |
 | GR00T N1.5  | 3B   | [🤗 Hugging Face](https://huggingface.co/nvidia/GR00T-N1.5-3B/tree/main)                   |
-| OpenVLA     | 7B   | [🤗 Hugging Face](https://huggingface.co/openvla/openvla-7b-finetuned-libero-10)           |
+| OpenVLA     | 7B   | [🤗 Hugging Face](https://huggingface.co/openvla/openvla-7b)                               |
 | PI0_base    | 3B   | [🤗 Hugging Face](https://huggingface.co/limxdynamics/FluxVLAEngine/tree/main/pi0_base)    |
 | PI05_base   | 3B   | [🤗 Hugging Face](https://huggingface.co/limxdynamics/FluxVLAEngine/tree/main/pi05_base)   |
 | PI05_libero | 3B   | [🤗 Hugging Face](https://huggingface.co/limxdynamics/FluxVLAEngine/tree/main/pi05_libero) |
@@ -678,6 +679,5 @@ pip install numpy==1.26.4
 - 支持更多 VLM 主干。
 - 支持更多 VLA 方法。
 - 支持使用 VLM 数据或思维链（CoT）数据进行训练。
-- RLDS 数据集将废弃并被 Parquet 数据集替代。
 - logger 功能将完整实现。
 - 支持 issacsim。
