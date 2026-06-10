@@ -16,6 +16,9 @@ from .attach_rabc_weight import AttachRABCWeight  # noqa: F401, F403
 from .fast_tokenizer import FASTTokenizer  # noqa: F401, F403
 from .normalize import *  # noqa: F401, F403
 from .prompters import *  # noqa: F401, F403
+from .robocasa_transforms import (  # noqa: F401, F403
+    DenormalizeRobocasaAction, ProcessRobocasaEvalInputs, RobocasaEvalDataset,
+    RobocasaGR1N15Bridge)
 from .transform_actions import *  # noqa: F401, F403
 from .transform_images import *  # noqa: F401, F403
 from .transform_inputs import *  # noqa: F401, F403
