@@ -457,3 +457,13 @@ def build_weighter_from_cfg(
     """Build an RA-BC sample weighter from a config dict."""
     from .root import WEIGHTERS
     return build_from_cfg(cfg, WEIGHTERS, default_args)
+
+
+def build_evaluator_from_cfg(
+        cfg: Union[dict, ConfigDict, Config],
+        default_args: Optional[Union[dict, 'ConfigDict',
+                                     'Config']] = None) -> Any:
+    """Build a training-time evaluator policy from config."""
+    from fluxvla.evaluators import evaluator_policies  # noqa: F401
+    from .root import EVALUATORS
+    return build_from_cfg(cfg, EVALUATORS, default_args)

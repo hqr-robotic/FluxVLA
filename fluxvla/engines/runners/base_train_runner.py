@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import gc
 import inspect
 import math
@@ -31,8 +32,8 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from fluxvla.engines.utils import check_bloat16_supported
 from fluxvla.engines.utils.name_map import str_to_dtype
 from fluxvla.engines.utils.torch_utils import worker_init_function
-from ..utils import (build_lr_scheduler_from_cfg, build_tokenizer_from_cfg,
-                     initialize_overwatch)
+from ..utils import (build_evaluator_from_cfg, build_lr_scheduler_from_cfg,
+                     build_tokenizer_from_cfg, initialize_overwatch)
 
 overwatch = initialize_overwatch(__name__)
 
@@ -88,12 +89,20 @@ class BaseTrainRunner(ABC):
                  enable_mixed_precision_training: bool = True,
                  reduce_in_full_precision: bool = True,
                  mixed_precision_dtype: str = 'bf16',
+                 grad_accumulation_steps: int = 1,
+                 evaluator: Optional[Dict] = None,
                  tokenizer: Optional[Dict] = None,
                  resume_from: Optional[str] = None):
         from ..utils.builder import (build_collator_from_cfg,
                                      build_metric_from_cfg, build_vla_from_cfg)
 
+        grad_accumulation_steps = int(grad_accumulation_steps)
+        assert grad_accumulation_steps >= 1, \
+            'Gradient accumulation steps must be >= 1!'
+
+        metric = metric.copy()
         metric['hparams'] = cfg
+        metric['grad_accumulation_steps'] = grad_accumulation_steps
         timestamp = datetime.now().strftime('%Y_%m_%d_%H_%M_%S')
         metric['run_id'] = (
             f"{os.path.basename(cfg.filename).replace('.py', '')}_{timestamp}")
@@ -134,8 +143,12 @@ class BaseTrainRunner(ABC):
         self.reduce_in_full_precision = reduce_in_full_precision
         self.mixed_precision_dtype = str_to_dtype(mixed_precision_dtype)
         self.per_device_batch_size = cfg.train_dataloader.per_device_batch_size
+        self.grad_accumulation_steps = grad_accumulation_steps
+        self.evaluator = (
+            build_evaluator_from_cfg(evaluator)
+            if evaluator is not None else None)
         self.global_batch_size = self.per_device_batch_size * \
-            overwatch.world_size()
+            overwatch.world_size() * self.grad_accumulation_steps
         if hasattr(cfg.train_dataloader, 'per_device_num_workers'):
             self.per_device_num_workers = cfg.train_dataloader.per_device_num_workers  # noqa: E501
         else:
@@ -165,8 +178,6 @@ class BaseTrainRunner(ABC):
         assert (
             self.global_batch_size % self.per_device_batch_size == 0
         ), 'Per-device batch size must evenly divide global batch size!'
-        self.grad_accumulation_steps = self.global_batch_size // self.per_device_batch_size // overwatch.world_size(  # noqa: E501
-        )
 
         if self.enable_mixed_precision_training:
             assert self.mixed_precision_dtype == torch.bfloat16, \
@@ -536,11 +547,10 @@ class BaseTrainRunner(ABC):
             return self.lr_scheduler.get_log_lr(self)
         return self.lr_scheduler.get_last_lr()[0]
 
-    def run(self, vla_dataset) -> None:
+    def run(self, vla_dataset, eval_dataset=None) -> None:
         """Train the VLA model."""
-        assert self.grad_accumulation_steps == 1, \
-            'VLA training does not support gradient accumulation!'
-
+        training_eval_dataset = (
+            vla_dataset if eval_dataset is None else eval_dataset)
         # Setup dataloader
         sampler = torch.utils.data.distributed.DistributedSampler(
             vla_dataset,
@@ -574,15 +584,67 @@ class BaseTrainRunner(ABC):
 
         try:
             if self.training_mode == 'step_based':
-                return self._run_step_based(dataloader, sampler)
+                return self._run_step_based(dataloader, sampler,
+                                            training_eval_dataset)
             else:
-                return self._run_epoch_based(dataloader, sampler)
+                return self._run_epoch_based(dataloader, sampler,
+                                             training_eval_dataset)
         finally:
             self._shutdown_dataloader(self._active_dataloader)
             self._active_dataloader = None
             gc.collect()
 
-    def _run_step_based(self, dataloader, sampler) -> str:
+    def _next_batch(self, dataloader, dataloader_iter, sampler):
+        """Fetch a micro-batch, restarting the epoch if the iterator ends."""
+        while True:
+            if dataloader_iter is None:
+                if sampler:
+                    sampler.set_epoch(self.current_epoch)
+                dataloader_iter = iter(dataloader)
+
+            try:
+                return next(dataloader_iter), dataloader_iter
+            except StopIteration:
+                self.current_epoch += 1
+                dataloader_iter = None
+
+    def _run_accumulated_training_step(self, dataloader, dataloader_iter,
+                                       sampler):
+        """Run one optimizer step made of one or more micro-batches."""
+        losses = []
+        for micro_step in range(self.grad_accumulation_steps):
+            batch, dataloader_iter = self._next_batch(dataloader,
+                                                      dataloader_iter, sampler)
+            should_step = micro_step == self.grad_accumulation_steps - 1
+            # Skip the DDP/FSDP gradient all-reduce on non-final
+            # micro-steps; gradients are synchronized only once when the
+            # accumulated optimizer step is taken.
+            with self._grad_sync_context(should_sync=should_step):
+                loss = self._training_step(batch, should_step=should_step)
+            losses.append(loss.detach())
+        mean_loss = torch.stack(losses).mean()
+        return float(mean_loss.item()), dataloader_iter
+
+    def _grad_sync_context(self, should_sync: bool):
+        """Return the gradient synchronization context for a micro-step.
+
+        For DDP/FSDP-wrapped models, ``no_sync()`` suppresses the gradient
+        all-reduce during ``backward``. We only need to synchronize on the
+        last micro-step of a gradient-accumulation window, which cuts the
+        gradient communication volume by a factor of
+        ``grad_accumulation_steps``. Falls back to a no-op context for the
+        final micro-step, single-GPU runs, or any model lacking
+        ``no_sync``.
+        """
+        if should_sync:
+            return contextlib.nullcontext()
+        no_sync = getattr(self.vla, 'no_sync', None)
+        if callable(no_sync):
+            return no_sync()
+        return contextlib.nullcontext()
+
+    def _run_step_based(self, dataloader, sampler,
+                        training_eval_dataset) -> str:
         """Step-based training loop. Handles infinite dataloaders."""
         with tqdm(
                 total=self.max_steps,
@@ -595,26 +657,9 @@ class BaseTrainRunner(ABC):
             epoch_step_count = 0
 
             while self.metric.global_step < self.max_steps:
-                # Init/reset iterator at epoch start
-                if dataloader_iter is None:
-                    if sampler:
-                        sampler.set_epoch(self.current_epoch)
-                    dataloader_iter = iter(dataloader)
-                    epoch_step_count = 0
-
-                # Get next batch
-                try:
-
-                    batch = next(dataloader_iter)
-                except StopIteration:
-                    # Finite dataloader exhausted, start new epoch
-                    self.current_epoch += 1
-                    dataloader_iter = None
-                    continue
-
-                loss = self._training_step(batch)
-                self._loss_accumulator.append(
-                    float(loss.detach().cpu().numpy().copy()))
+                loss, dataloader_iter = self._run_accumulated_training_step(
+                    dataloader, dataloader_iter, sampler)
+                self._loss_accumulator.append(loss)
                 epoch_step_count += 1
 
                 # Update metrics
@@ -624,6 +669,9 @@ class BaseTrainRunner(ABC):
                     lr=self._get_log_lr())
                 progress.set_description(self.metric.push(), refresh=False)
                 progress.update()
+                if (self.evaluator is not None
+                        and self.evaluator.should_run(self)):
+                    self.evaluator.run(self, training_eval_dataset)
 
                 # Save checkpoint
                 if self._should_save_step_checkpoint():
@@ -637,7 +685,8 @@ class BaseTrainRunner(ABC):
 
         return self._get_checkpoint_path()
 
-    def _run_epoch_based(self, dataloader, sampler) -> str:
+    def _run_epoch_based(self, dataloader, sampler,
+                         training_eval_dataset) -> str:
         """Epoch-based training with nested progress bars. Handles
             infinite dataloaders.
 
@@ -670,16 +719,10 @@ class BaseTrainRunner(ABC):
                         disable=not overwatch.is_rank_zero()) as iter_pbar:
 
                     while True:
-                        # Get next batch
-                        try:
-                            batch = next(dataloader_iter)
-                        except StopIteration:
-                            # Finite dataloader exhausted
-                            break
-
-                        loss = self._training_step(batch)
-                        self._loss_accumulator.append(
-                            float(loss.detach().cpu().numpy().copy()))
+                        loss, dataloader_iter = \
+                            self._run_accumulated_training_step(
+                                dataloader, dataloader_iter, sampler)
+                        self._loss_accumulator.append(loss)
                         epoch_step_count += 1
 
                         # Update metrics
@@ -689,6 +732,9 @@ class BaseTrainRunner(ABC):
                             lr=self._get_log_lr())
                         iter_pbar.set_description(self.metric.push())
                         iter_pbar.update()
+                        if (self.evaluator is not None
+                                and self.evaluator.should_run(self)):
+                            self.evaluator.run(self, training_eval_dataset)
 
                         # For infinite dataloaders: end epoch by step count
                         if (self.steps_per_epoch
@@ -724,7 +770,8 @@ class BaseTrainRunner(ABC):
             f'Training: mode={self.training_mode}, epochs={self.max_epochs}, '
             f'steps/epoch={self.steps_per_epoch}, '
             f'batch={self.global_batch_size} '
-            f'({self.per_device_batch_size}x{overwatch.world_size()})')
+            f'({self.per_device_batch_size}x{overwatch.world_size()}'
+            f'x{self.grad_accumulation_steps})')
 
     def _vla_accepts_kwarg(self, key: str) -> bool:
         """Return whether the wrapped VLA forward accepts ``key``."""
@@ -741,7 +788,24 @@ class BaseTrainRunner(ABC):
         self._vla_accepts_kwarg_cache = cache
         return accepts
 
-    def _training_step(self, batch) -> torch.Tensor:
+    @staticmethod
+    def _collect_output_loss_metrics(output) -> Dict[str, torch.Tensor]:
+        """Collect scalar loss components returned by a VLA forward pass."""
+        if not hasattr(output, 'items'):
+            return {}
+
+        metrics = {}
+        reserved_keys = {'loss'}
+        for key, value in output.items():
+            if key in reserved_keys:
+                continue
+            if not (key.startswith('loss_') or key.endswith('_loss')):
+                continue
+            if isinstance(value, torch.Tensor) and value.numel() == 1:
+                metrics[key] = value
+        return metrics
+
+    def _training_step(self, batch, should_step: bool = True) -> torch.Tensor:
         """Execute single training step: forward, backward, optimize."""
         self.lr_scheduler.prepare_step(self)
         batch = self._prepare_batch(
@@ -757,9 +821,10 @@ class BaseTrainRunner(ABC):
                 enabled=self.enable_mixed_precision_training):
             output: CausalLMOutputWithPast = self.vla(**batch)
             loss = output['loss']
+            loss_metrics = self._collect_output_loss_metrics(output)
 
-        self.metric.commit(loss=loss)
-        loss.backward()
+        self.metric.commit(loss=loss, **loss_metrics)
+        (loss / self.grad_accumulation_steps).backward()
 
         # Commit per-dataset metrics
         if overwatch.is_rank_zero() and all(k in output for k in [
@@ -770,6 +835,9 @@ class BaseTrainRunner(ABC):
                                    output['action_l1_loss_ds']):
                 self.metric.commit_for_dataset(
                     dataset_name=ds.decode(), action_accuracy=acc, l1_loss=l1)
+
+        if not should_step:
+            return loss.detach()
 
         # Gradient step with fallback on optimizer state mismatch
         self.clip_grad_norm()
@@ -788,7 +856,7 @@ class BaseTrainRunner(ABC):
         if hasattr(self, '_custom_training_step'):
             custom_loss = self._custom_training_step(batch, output, loss)
             if custom_loss is not None:
-                loss = torch.tensor(custom_loss)
+                loss = loss.detach().new_tensor(custom_loss)
 
         return loss
 

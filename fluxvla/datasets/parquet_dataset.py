@@ -36,6 +36,7 @@ class ParquetDataset(Dataset):
                  statistic_name: str = 'private',
                  window_start_idx: int = 1,
                  frame_window_size: int = 1,
+                 frame_sample_stride: int = 1,
                  train_episode_fraction: float = 1.0,
                  repeat_to_full_length: bool = False,
                  expose_index: bool = False) -> None:
@@ -65,6 +66,13 @@ class ParquetDataset(Dataset):
                 Defaults to 'private'.
             window_start_idx (int): Start index for the action window.
                 Defaults to 1.
+            frame_window_size (int): Number of video frames to expose via
+                ``frame_timestamps``. Defaults to 1 (single current frame).
+            frame_sample_stride (int): Stride (in dataset rows) between the
+                sampled video frames. Defaults to 1 (consecutive frames).
+                Increase this when the sampled frames should span a longer
+                temporal window:
+                ``(frame_window_size - 1) * frame_sample_stride`` rows.
             train_episode_fraction (float): Fraction of episodes to sample
                 from each data root, preserving original episode order.
                 Defaults to 1.0.
@@ -149,6 +157,7 @@ class ParquetDataset(Dataset):
         self.statistic_name = statistic_name
         self.window_start_idx = window_start_idx
         self.frame_window_size = frame_window_size
+        self.frame_sample_stride = frame_sample_stride
         self.expose_index = expose_index
         for transform in transforms:
             self.transforms.append(build_transform_from_cfg(transform))
@@ -276,7 +285,7 @@ class ParquetDataset(Dataset):
             frame_timestamps = [data['timestamp']]
             frame_masks = [1]
             for fi in range(1, self.frame_window_size):
-                future_idx = index + fi
+                future_idx = index + fi * self.frame_sample_stride
                 if (future_idx < len(self.dataset)
                         and self.dataset[future_idx]['episode_index']
                         == data['episode_index'] and
