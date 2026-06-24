@@ -49,7 +49,7 @@ def _import_wan_encoder_modules():
 
 
 @VLM_BACKBONES.register_module()
-class WanBackbone(nn.Module):
+class Wan21Backbone(nn.Module):
     """Wan 2.1 encoder backbone: T5 text encoder, CLIP image encoder, VAE.
 
     These modules are always frozen during training and serve as the
@@ -224,4 +224,4 @@ class WanBackbone(nn.Module):
         )
 
 
-__all__ = ['WanBackbone']
+__all__ = ['Wan21Backbone']
