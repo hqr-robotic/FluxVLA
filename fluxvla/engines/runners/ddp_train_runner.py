@@ -116,6 +116,8 @@ class DDPTrainRunner(BaseTrainRunner):
                  enable_mixed_precision_training: bool = True,
                  reduce_in_full_precision: bool = True,
                  mixed_precision_dtype: str = 'bf16',
+                 grad_accumulation_steps: int = 1,
+                 evaluator: Optional[Dict] = None,
                  tokenizer: Optional[Dict] = None,
                  resume_from: Optional[str] = None,
                  static_graph: bool = True,
@@ -140,6 +142,8 @@ class DDPTrainRunner(BaseTrainRunner):
             enable_mixed_precision_training=enable_mixed_precision_training,
             reduce_in_full_precision=reduce_in_full_precision,
             mixed_precision_dtype=mixed_precision_dtype,
+            grad_accumulation_steps=grad_accumulation_steps,
+            evaluator=evaluator,
             tokenizer=tokenizer,
             resume_from=resume_from)
 
@@ -871,7 +875,7 @@ class DDPTrainRunner(BaseTrainRunner):
 
         return smoothened_loss
 
-    def run(self, vla_dataset):
+    def run(self, vla_dataset, eval_dataset=None):
         """Run training with DDP-specific enhancements while using BaseTrainRunner logic."""  # noqa: E501
         # Save dataset statistics if available
         if overwatch.is_rank_zero():
@@ -881,4 +885,4 @@ class DDPTrainRunner(BaseTrainRunner):
                                         self.args.work_dir)
 
         # Use parent's training logic
-        return super().run(vla_dataset)
+        return super().run(vla_dataset, eval_dataset=eval_dataset)

@@ -13,9 +13,12 @@
 # limitations under the License.
 """Shared utilities for simulation evaluation runners."""
 
+import copy
 import os
 from pathlib import Path
 from typing import Any, Dict
+
+import torch
 
 from fluxvla.engines.utils import initialize_overwatch
 from fluxvla.engines.utils.name_map import str_to_dtype
@@ -41,10 +44,66 @@ class BaseEvalRunner:
         return build_vla_from_cfg(cfg.model).eval()
 
     @staticmethod
+    def _set_model_cfg_value(model_cfg, key: str, value) -> None:
+        if isinstance(model_cfg, dict):
+            model_cfg[key] = value
+        else:
+            setattr(model_cfg, key, value)
+
+    @staticmethod
+    def _resolve_model_build_dtype(dtype):
+        if dtype is None:
+            return None
+        if isinstance(dtype, torch.dtype):
+            return dtype
+        return str_to_dtype(str(dtype))
+
+    @classmethod
+    def prepare_eval_model_cfg(cls,
+                               cfg,
+                               model_build_device: str = None,
+                               model_build_dtype=None):
+        """Copy the eval model config and apply construction overrides."""
+        if hasattr(cfg, 'inference_model'):
+            model_cfg = copy.deepcopy(cfg.inference_model)
+        else:
+            model_cfg = copy.deepcopy(cfg.model)
+
+        if model_build_device is not None:
+            cls._set_model_cfg_value(model_cfg, 'device',
+                                     str(model_build_device))
+        resolved_dtype = cls._resolve_model_build_dtype(model_build_dtype)
+        if resolved_dtype is not None:
+            cls._set_model_cfg_value(model_cfg, 'torch_dtype', resolved_dtype)
+        return model_cfg
+
+    @staticmethod
     def default_stats_path(ckpt_path: str) -> str:
         """Return the checkpoint-relative dataset statistics path."""
         return os.path.join(
             Path(ckpt_path).resolve().parent.parent, 'dataset_statistics.json')
+
+    def load_eval_state_dict(
+        self, state_dict: Dict,
+        allowed_missing_key_prefixes=()) -> None:  # noqa: E125
+        """Load eval weights with optional missing-key prefixes."""
+        missing, unexpected = self.vla.load_state_dict(
+            state_dict, strict=False)
+        unexpected = list(unexpected)
+        assert not unexpected, (
+            'Unexpected keys while loading eval checkpoint: '
+            f'{unexpected[:10]}')
+        if isinstance(allowed_missing_key_prefixes, str):
+            allowed_missing_key_prefixes = (allowed_missing_key_prefixes, )
+        else:
+            allowed_missing_key_prefixes = tuple(allowed_missing_key_prefixes)
+        offending = [
+            k for k in missing if not any(
+                k.startswith(prefix)
+                for prefix in allowed_missing_key_prefixes)
+        ]
+        assert not offending, ('Missing keys while loading eval checkpoint: '
+                               f'{offending[:10]}')
 
     def set_common_eval_attrs(self, cfg: Dict, seed: int, ckpt_path: str,
                               model_family: str, mixed_precision_dtype: str,

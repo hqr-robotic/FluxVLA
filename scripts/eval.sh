@@ -16,6 +16,15 @@ NODE_RANK="${RANK:-${MLP_ROLE_INDEX:-0}}"
 MASTER_ADDR="${MASTER_ADDR:-${MLP_WORKER_0_HOST:-localhost}}"
 MASTER_PORT="${MASTER_PORT:-${MLP_WORKER_0_PORT:-29500}}"
 
+# torchrun only auto-sets OMP_NUM_THREADS=1 when nproc_per_node > 1. For
+# single-process launches (e.g. per-task LIBERO manager workers, which invoke
+# this script with NPROC_PER_NODE=1) pin it too; otherwise each worker spawns
+# ~num_cores CPU threads and oversubscribes the host when many workers run side
+# by side, slowing CPU-bound rollouts several-fold. An explicit value is kept.
+if [[ "${NPROC_PER_NODE}" == "1" && -z "${OMP_NUM_THREADS:-}" ]]; then
+  export OMP_NUM_THREADS=1
+fi
+
 torchrun \
   --nproc-per-node="${NPROC_PER_NODE}" \
   --nnodes="${WORLD_SIZE}" \
