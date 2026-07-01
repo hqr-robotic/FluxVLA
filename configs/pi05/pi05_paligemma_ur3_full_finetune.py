@@ -182,7 +182,7 @@ train_dataloader = dict(
 runner = dict(
     type='FSDPTrainRunner',
     max_epochs=6,
-    optimizer=dict(lr=5e-5, type='AdamW', weight_decay=0.01),
+    optimizer=dict(lr=1e-5, type='AdamW', weight_decay=1e-5),
     max_grad_norm=1.0,
     sharding_strategy='no-shard',
     collator=dict(
@@ -262,9 +262,13 @@ inference = dict(
     action_chunk=50,
     operator=dict(
         type='UROperator',
+        command_mode='joint',
         img_left_topic='/wrist_camera/color/image_raw',
         img_front_topic='/front_camera/color/image_raw',
-        puppet_arm_left_topic='/joint_states',
-        puppet_gripper_left_topic='/gripper/position',
-        puppet_ee_pose_left_topic='/arm/tcp_pose',
+        joint_state_topic='/joint_states',
+        gripper_state_topic='/gripper/position',
+        cartesian_pose_topic='/arm/tcp_pose',
+        joint_cmd_topic='/cmd/servoj',
+        cartesian_cmd_topic='/cmd/servol',
+        gripper_cmd_topic='/cmd/gripper',
         use_depth_image=False))
