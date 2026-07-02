@@ -449,7 +449,6 @@ def save_rollout_video(rollout_images,
             frame = np.array(img)
         video_writer.append_data(frame)
     video_writer.close()
-    print(f'Saved rollout MP4 at path {mp4_path}')
     if log_file is not None:
         log_file.write(f'Saved rollout MP4 at path {mp4_path}\n')
     return mp4_path

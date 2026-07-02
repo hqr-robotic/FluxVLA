@@ -216,6 +216,31 @@ class LiberoEvalRunner(BaseEvalRunner):
         ]
 
     @staticmethod
+    def _write_rank_progress(progress_dir: str, rank: int, episodes: int,
+                             successes: int) -> None:
+        os.makedirs(progress_dir, exist_ok=True)
+        progress_path = os.path.join(progress_dir, f'rank{rank}.json')
+        tmp_path = f'{progress_path}.tmp'
+        with open(tmp_path, 'w', encoding='utf-8') as f:
+            json.dump(
+                dict(rank=rank, episodes=episodes, successes=successes), f)
+        os.replace(tmp_path, progress_path)
+
+    @staticmethod
+    def _read_rank_progress(progress_dir: str) -> tuple:
+        total_episodes = 0
+        total_successes = 0
+        for progress_path in Path(progress_dir).glob('rank*.json'):
+            try:
+                with open(progress_path, 'r', encoding='utf-8') as f:
+                    progress = json.load(f)
+                total_episodes += int(progress.get('episodes', 0))
+                total_successes += int(progress.get('successes', 0))
+            except (OSError, json.JSONDecodeError, TypeError, ValueError):
+                continue
+        return total_episodes, total_successes
+
+    @staticmethod
     def _get_max_steps(task_suite_name: str, override: int = None) -> int:
         """Per-suite rollout horizon."""
         suite_steps = {
@@ -563,6 +588,10 @@ class LiberoEvalRunner(BaseEvalRunner):
         self.run_dir = self._build_run_dir(
             self.ckpt_path, run_id, output_dir=self.result_output_dir)
         os.makedirs(self.run_dir, exist_ok=True)
+        progress_dir = os.path.join(self.run_dir, 'rank_progress')
+        total_eval_episodes = len(
+            self._build_global_episodes(num_tasks, self.num_trials_per_task,
+                                        task_ids))
         local_log_filepath = self._build_log_file_path(self.ckpt_path, run_id,
                                                        rank,
                                                        self.result_output_dir)
@@ -584,8 +613,8 @@ class LiberoEvalRunner(BaseEvalRunner):
                 'not found in VLA norm_stats!')
         if rank == 0:
             pbar = tqdm.tqdm(
-                total=len(local_episodes),
-                desc='Evaluation rank0',
+                total=total_eval_episodes,
+                desc='Evaluation global',
                 dynamic_ncols=True)
         else:
             pbar = None
@@ -762,12 +791,30 @@ class LiberoEvalRunner(BaseEvalRunner):
                         save_multi_view=self.save_multi_view_rollout_videos)
                 rank_success_rate = (
                     rank_success_count / rank_episode_count * 100)
+                self._write_rank_progress(progress_dir, rank,
+                                          rank_episode_count,
+                                          rank_success_count)
+                display_episode_count = rank_episode_count
+                display_success_count = rank_success_count
+                display_success_rate = rank_success_rate
                 if rank == 0 and pbar is not None:
+                    display_episode_count, display_success_count = \
+                        self._read_rank_progress(progress_dir)
+                    display_success_rate = (
+                        display_success_count / max(display_episode_count, 1) *
+                        100)
+                    pbar_delta = max(display_episode_count - pbar.n, 0)
+                    overwatch.info('[eval-progress] '
+                                   f'episodes={display_episode_count}/'
+                                   f'{total_eval_episodes} '
+                                   f'successes={display_success_count} '
+                                   f'success_rate={display_success_rate:.2f}%')
                     pbar.set_postfix(
-                        successes=rank_success_count,
-                        episodes=rank_episode_count,
-                        success_rate=f'{rank_success_rate:.1f}%')
-                    pbar.update(1)
+                        successes=display_success_count,
+                        episodes=display_episode_count,
+                        success_rate=f'{display_success_rate:.1f}%')
+                    if pbar_delta > 0:
+                        pbar.update(pbar_delta)
 
                 # except Exception as e:
                 #     print(f'Error during action prediction: {e}')

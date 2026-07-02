@@ -28,9 +28,12 @@
 # Defaults are resolved as: environment override -> config value -> built-in
 # fallback. Manager-only defaults should be set in config via
 # ``eval = dict(runner=dict(...), manager=dict(...))``.
+# If OUTPUT_DIR is unset, the manager uses eval.manager.output_dir, then
+# eval.runner.result_output_dir, then a timestamped work_dirs fallback.
 #
 # OUTPUT_DIR layout:
-#   summary.{csv,txt,json}, task_success_rates.csv, failed_tasks.txt,
+#   summary.{csv,txt,json}, suite_success_rates.csv,
+#   task_success_rates.csv, failed_tasks.txt,
 #   task_logs/, task_status/, <suite>/gpuX_taskY_results.json,
 #   <suite>/videos/*.mp4 unless ROLLOUT_DIR/eval.rollout_dir overrides it
 #
@@ -54,7 +57,7 @@ PREPROCESS_EVERY_STEP="${PREPROCESS_EVERY_STEP:-}"
 SAVE_FAILED_ROLLOUT_VIDEOS="${SAVE_FAILED_ROLLOUT_VIDEOS:-}"
 SAVE_MULTI_VIEW_ROLLOUT_VIDEOS="${SAVE_MULTI_VIEW_ROLLOUT_VIDEOS:-}"
 ROLLOUT_DIR="${ROLLOUT_DIR:-}"
-OUTPUT_DIR="${OUTPUT_DIR:-work_dirs/libero_eval_manager/$(date +%Y%m%d_%H%M%S)}"
+OUTPUT_DIR="${OUTPUT_DIR:-}"
 EXTRA_ARGS=("$@")
 
 DEFAULT_SUITES="libero_10 libero_goal libero_spatial libero_object"
@@ -84,6 +87,7 @@ CFG_STATUS_INTERVAL=""
 CFG_LAUNCH_DELAY=""
 CFG_SUMMARY_TOOL=""
 CFG_TASK_FILE=""
+CFG_OUTPUT_DIR=""
 CFG_SAVE_ROLLOUT_VIDEOS=""
 CFG_SAVE_MULTI_VIEW_ROLLOUT_VIDEOS=""
 CFG_ROLLOUT_DIR=""
@@ -103,6 +107,7 @@ while IFS=$'\t' read -r key value; do
     CFG_LAUNCH_DELAY) CFG_LAUNCH_DELAY="${value}" ;;
     CFG_SUMMARY_TOOL) CFG_SUMMARY_TOOL="${value}" ;;
     CFG_TASK_FILE) CFG_TASK_FILE="${value}" ;;
+    CFG_OUTPUT_DIR) CFG_OUTPUT_DIR="${value}" ;;
     CFG_SAVE_ROLLOUT_VIDEOS) CFG_SAVE_ROLLOUT_VIDEOS="${value}" ;;
     CFG_SAVE_MULTI_VIEW_ROLLOUT_VIDEOS) CFG_SAVE_MULTI_VIEW_ROLLOUT_VIDEOS="${value}" ;;
     CFG_ROLLOUT_DIR) CFG_ROLLOUT_DIR="${value}" ;;
@@ -163,6 +168,9 @@ fields = {
     'CFG_LAUNCH_DELAY': ('eval.manager.launch_delay', ),
     'CFG_SUMMARY_TOOL': ('eval.manager.summary_tool', ),
     'CFG_TASK_FILE': ('eval.manager.task_file', ),
+    'CFG_OUTPUT_DIR': (
+        'eval.manager.output_dir', 'eval.runner.result_output_dir',
+        'eval.output_dir', 'eval.result_output_dir'),
     'CFG_SAVE_ROLLOUT_VIDEOS': (
         'eval.runner.save_rollout_videos', 'eval.save_rollout_videos'),
     'CFG_SAVE_MULTI_VIEW_ROLLOUT_VIDEOS': (
@@ -177,6 +185,16 @@ PY
 )
 
 EVAL_RUNNER_PREFIX="${CFG_EVAL_RUNNER_PREFIX:-eval}"
+
+if [[ -n "${OUTPUT_DIR:-}" ]]; then
+  OUTPUT_DIR_SOURCE="env"
+elif [[ -n "${CFG_OUTPUT_DIR}" ]]; then
+  OUTPUT_DIR="${CFG_OUTPUT_DIR}"
+  OUTPUT_DIR_SOURCE="config"
+else
+  OUTPUT_DIR="work_dirs/libero_eval_manager/$(date +%Y%m%d_%H%M%S)"
+  OUTPUT_DIR_SOURCE="default"
+fi
 
 if [[ -n "${SUITES:-}" ]]; then
   SUITES_SOURCE="env"
@@ -210,6 +228,8 @@ fi
 
 if [[ -n "${MASTER_PORT_BASE:-}" ]]; then
   :
+elif [[ -n "${MASTER_PORT:-}" ]]; then
+  MASTER_PORT_BASE="${MASTER_PORT}"
 elif [[ -n "${CFG_MASTER_PORT_BASE}" ]]; then
   MASTER_PORT_BASE="${CFG_MASTER_PORT_BASE}"
 else
@@ -417,6 +437,7 @@ write_manager_config() {
     echo "save_multi_view_rollout_videos: ${SAVE_MULTI_VIEW_ROLLOUT_VIDEOS:-config default}"
     echo "rollout_dir: ${ROLLOUT_DIR:-default}"
     echo "output_dir: ${OUTPUT_DIR}"
+    echo "output_dir_source: ${OUTPUT_DIR_SOURCE}"
     echo "task_file: ${task_file}"
   } > "${OUTPUT_DIR}/manager_config.yaml"
 }
@@ -443,9 +464,11 @@ if [[ "${total_tasks}" -eq 0 ]]; then
 fi
 
 declare -A SEEN_SUITES
+declare -A SUITE_TOTAL_TASKS
 SUITE_ORDER=()
 for task_entry in "${TASK_QUEUE[@]}"; do
   suite_name="${task_entry%%,*}"
+  SUITE_TOTAL_TASKS["${suite_name}"]=$((${SUITE_TOTAL_TASKS[${suite_name}]:-0} + 1))
   if [[ -z "${SEEN_SUITES[${suite_name}]:-}" ]]; then
     SUITE_ORDER+=("${suite_name}")
     SEEN_SUITES["${suite_name}"]=1
@@ -461,6 +484,7 @@ overall_eval_episodes=0
 
 declare -A SUITE_EVAL_SUCCESSES
 declare -A SUITE_EVAL_EPISODES
+declare -A SUITE_COMPLETED_TASKS
 
 running_pids=()
 running_gpus=()
@@ -589,6 +613,23 @@ print(f'{successes / max(episodes, 1) * 100:.2f}')
 PY
 }
 
+write_suite_success_rates_file() {
+  local output_file="${OUTPUT_DIR}/suite_success_rates.csv"
+  {
+    echo "Suite,Completed Tasks,Total Tasks,Successes,Episodes,Success Rate (%)"
+    local suite_name
+    for suite_name in "${SUITE_ORDER[@]}"; do
+      local completed="${SUITE_COMPLETED_TASKS[${suite_name}]:-0}"
+      local total="${SUITE_TOTAL_TASKS[${suite_name}]:-0}"
+      local successes="${SUITE_EVAL_SUCCESSES[${suite_name}]:-0}"
+      local episodes="${SUITE_EVAL_EPISODES[${suite_name}]:-0}"
+      local success_rate
+      success_rate="$(format_success_rate "${successes}" "${episodes}")"
+      echo "${suite_name},${completed},${total},${successes},${episodes},${success_rate}"
+    done
+  } > "${output_file}"
+}
+
 format_eval_success_rate() {
   format_success_rate "${overall_eval_successes}" \
     "${overall_eval_episodes}"
@@ -665,14 +706,18 @@ poll_finished_tasks() {
       status="${status_line%%|*}"
       wait "${pid}" 2>/dev/null || true
       GPU_LOAD["${gpu}"]=$((GPU_LOAD["${gpu}"] - 1))
+      local suite_name="${task_info%,*}"
       completed_tasks=$((completed_tasks + 1))
       if [[ "${status}" == "FAILED" ]]; then
         failed_tasks=$((failed_tasks + 1))
+        SUITE_COMPLETED_TASKS["${suite_name}"]=$((${SUITE_COMPLETED_TASKS[${suite_name}]:-0} + 1))
+        write_suite_success_rates_file
         echo "[manager] failed ${task_info}: ${status_line}" | tee -a "${OUTPUT_DIR}/failed_tasks.txt"
       else
-        local suite_name="${task_info%,*}"
         record_eval_result "${suite_name}" \
           "${OUTPUT_DIR}/${suite_name}/gpu${gpu}_task${task_info#*,}_results.json"
+        SUITE_COMPLETED_TASKS["${suite_name}"]=$((${SUITE_COMPLETED_TASKS[${suite_name}]:-0} + 1))
+        write_suite_success_rates_file
         local task_success_rate
         local suite_success_rate
         local overall_success_rate
@@ -693,6 +738,9 @@ poll_finished_tasks() {
       fi
       GPU_LOAD["${gpu}"]=$((GPU_LOAD["${gpu}"] - 1))
       completed_tasks=$((completed_tasks + 1))
+      local suite_name="${task_info%,*}"
+      SUITE_COMPLETED_TASKS["${suite_name}"]=$((${SUITE_COMPLETED_TASKS[${suite_name}]:-0} + 1))
+      write_suite_success_rates_file
       failed_tasks=$((failed_tasks + 1))
       echo "[manager] failed ${task_info}: child exited before writing status (rc=${rc}, log=${log_file})" \
         | tee -a "${OUTPUT_DIR}/failed_tasks.txt"
@@ -730,6 +778,7 @@ show_status() {
 
 write_gpu_load_file
 write_manager_config
+write_suite_success_rates_file
 
 echo "[manager] config=${CONFIG}"
 echo "[manager] ckpt=${ckpt_abs}"
