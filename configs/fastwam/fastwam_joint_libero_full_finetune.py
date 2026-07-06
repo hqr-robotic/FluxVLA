@@ -15,7 +15,7 @@
 # FastWAM world-action model (joint) jointly trained on all four LIBERO
 # suites (spatial + object + goal + 10).
 
-_ckpt_root = './checkpoints'
+_ckpt_root = '/root/projects/ryanhu/checkpoints'
 _tokenizer = _ckpt_root + '/Wan-AI/Wan2.1-T2V-1.3B/google/umt5-xxl'
 
 _frame_window_size = 9
@@ -326,6 +326,8 @@ eval = dict(
         ),
     ),
     manager=dict(
+        output_dir=('/root/projects/ryanhu/FluxVLA/FastWAM/evaluate_results/'
+                    'libero/fastwam_joint_libero_full_finetune'),
         num_gpus=8,
         max_tasks_per_gpu=2,
         master_port_base=29690,

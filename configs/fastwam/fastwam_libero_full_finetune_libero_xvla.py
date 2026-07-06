@@ -22,16 +22,20 @@ _frame_window_size = 9
 _action_window_size = 32
 _frame_sample_stride = 4
 
-# MuJoCo 3.3.2 LIBERO no-noops LeRobot export used by the
-# original FastWAM full-suite checkpoints.
-_libero_root = '/root/projects/ryanhu/data/libero_mujoco3.3.2/'
+# This 30Hz statefix export keeps the same four LIBERO suites in LeRobot v2.1
+# format, but uses 256x256 H.264 videos and different state statistics from
+# the MuJoCo 3.3.2 release. Use a separate statistic key so checkpoints do not
+# silently reuse the old 20Hz `libero_no_noops` normalization.
+_libero_root = (
+    '/mnt/data/cpfs/mnt/data/yanis/datasets/'
+    'libero_4suite_unified_lerobotv2_30hz_statefix_fullfintuneeval/')
 _data_root_path = [
-    _libero_root + 'libero_spatial_no_noops_lerobot',
-    _libero_root + 'libero_object_no_noops_lerobot',
-    _libero_root + 'libero_goal_no_noops_lerobot',
-    _libero_root + 'libero_10_no_noops_lerobot',
+    _libero_root + 'libero_spatial_lerobotv2.1',
+    _libero_root + 'libero_object_lerobotv2.1',
+    _libero_root + 'libero_goal_lerobotv2.1',
+    _libero_root + 'libero_10_lerobotv2.1',
 ]
-_statistic_name = 'libero_no_noops'
+_statistic_name = 'libero_30hz_statefix_no_noops'
 
 model = dict(
     type='FastWAMVLA',
@@ -47,7 +51,7 @@ model = dict(
         tokenizer_model_id='Wan-AI/Wan2.1-T2V-1.3B',
         tokenizer_max_len=128,
         load_text_encoder=False,
-        redirect_common_files=False,
+        redirect_common_files=True,
     ),
     vla_head=dict(
         type='FastWAMHead',
@@ -243,7 +247,7 @@ runner = dict(
 )
 
 # Default full-suite rollout. eval.py runs each listed suite in sequence.
-# norm_stats_key keeps the MuJoCo 3.3.2 no-noops statistics carried by the
+# norm_stats_key keeps the merged 30Hz statefix statistics carried by the
 # checkpoint.
 eval = dict(
     runner=dict(
@@ -329,7 +333,7 @@ eval = dict(
     ),
     manager=dict(
         output_dir=('/root/projects/ryanhu/FluxVLA/FastWAM/evaluate_results/'
-                    'libero/fastwam_libero_full_finetune'),
+                    'libero/fastwam_libero_full_finetune_libero_xvla'),
         num_gpus=8,
         max_tasks_per_gpu=2,
         master_port_base=29690,

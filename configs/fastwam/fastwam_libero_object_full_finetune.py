@@ -12,26 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# FastWAM world-action model (uncond) jointly trained on all four LIBERO
-# suites (spatial + object + goal + 10).
+# FastWAM world-action model (uncond) on LIBERO-10.
 
 _ckpt_root = '/root/projects/ryanhu/checkpoints'
 _tokenizer = _ckpt_root + '/Wan-AI/Wan2.1-T2V-1.3B/google/umt5-xxl'
 
 _frame_window_size = 9
-_action_window_size = 32
-_frame_sample_stride = 4
-
-# MuJoCo 3.3.2 LIBERO no-noops LeRobot export used by the
-# original FastWAM full-suite checkpoints.
-_libero_root = '/root/projects/ryanhu/data/libero_mujoco3.3.2/'
-_data_root_path = [
-    _libero_root + 'libero_spatial_no_noops_lerobot',
-    _libero_root + 'libero_object_no_noops_lerobot',
-    _libero_root + 'libero_goal_no_noops_lerobot',
-    _libero_root + 'libero_10_no_noops_lerobot',
-]
-_statistic_name = 'libero_no_noops'
 
 model = dict(
     type='FastWAMVLA',
@@ -39,7 +25,7 @@ model = dict(
     num_views=2,
     frame_window_size=_frame_window_size,
     proprio_dim=8,
-    action_horizon=_action_window_size,
+    action_horizon=32,
     mot_checkpoint_mixed_attn=True,
     vlm_backbone=dict(
         type='Wan22Backbone',
@@ -47,7 +33,7 @@ model = dict(
         tokenizer_model_id='Wan-AI/Wan2.1-T2V-1.3B',
         tokenizer_max_len=128,
         load_text_encoder=False,
-        redirect_common_files=False,
+        redirect_common_files=True,
     ),
     vla_head=dict(
         type='FastWAMHead',
@@ -114,10 +100,11 @@ train_dataloader = dict(
             'action': ['action'],
         },
         statistic_keys=['observation.state', 'timestamp', 'action'],
-        statistic_name=_statistic_name,
+        statistic_name='libero_object_no_noops',
         datasets=dict(
             type='ParquetDataset',
-            data_root_path=_data_root_path,
+            data_root_path=  # noqa: E251
+            '/root/projects/ryanhu/data/libero_mujoco3.3.2/libero_object_no_noops_lerobot',  # noqa: E501
             transforms=[
                 dict(
                     type='ProcessParquetInputs',
@@ -177,22 +164,16 @@ train_dataloader = dict(
                     enc_id='wan22ti2v5b',
                 ),
             ],
-            action_window_size=_action_window_size,
+            action_window_size=32,
             action_key='action',
             use_delta=False,
-            statistic_name=_statistic_name,
+            statistic_name='libero_object_no_noops',
             window_start_idx=0,
             frame_window_size=_frame_window_size,
-            frame_sample_stride=_frame_sample_stride,
+            frame_sample_stride=4,
         ),
     ),
 )
-
-# Optional in-training eval dataset for the FastWAM-style wandb eval metrics.
-# Leave both as None to match the FastWAM LIBERO source config, where
-# val_dataset falls back to train_dataset when no validation split is defined.
-val_dataloader = None
-eval_dataset = None
 
 runner = dict(
     type='DDPTrainRunner',
@@ -242,32 +223,19 @@ runner = dict(
     ),
 )
 
-# Default full-suite rollout. eval.py runs each listed suite in sequence.
-# norm_stats_key keeps the MuJoCo 3.3.2 no-noops statistics carried by the
-# checkpoint.
 eval = dict(
     runner=dict(
         type='LiberoEvalRunner',
-        task_suite_name=[
-            'libero_spatial',
-            'libero_object',
-            'libero_goal',
-            'libero_10',
-        ],
+        task_suite_name='libero_object',
         model_family='fastwam',
         task_ids=None,
         allowed_missing_key_prefixes=('vlm_backbone.text_encoder.', ),
-        norm_stats_key=_statistic_name,
+        norm_stats_key='libero_object_no_noops',
         eval_chunk_size=10,
         eval_shard_strategy='task',
         preprocess_every_step=False,
         num_inference_steps=10,
-        max_steps=dict(
-            libero_spatial=400,
-            libero_object=400,
-            libero_goal=400,
-            libero_10=700,
-        ),
+        max_steps=400,
         inference_seed=42,
         resize_size=224,
         num_trials_per_task=50,
@@ -329,7 +297,7 @@ eval = dict(
     ),
     manager=dict(
         output_dir=('/root/projects/ryanhu/FluxVLA/FastWAM/evaluate_results/'
-                    'libero/fastwam_libero_full_finetune'),
+                    'libero/fastwam_libero_object_full_finetune'),
         num_gpus=8,
         max_tasks_per_gpu=2,
         master_port_base=29690,
