@@ -651,3 +651,124 @@ class PrivateInferenceDataset:
                 2 * (normalized_states - state_low) /
                 (state_high - state_low + 1e-8) - 1, -1, 1), normalized_states)
         return states
+
+
+@DATASETS.register_module()
+class FastWAMPrivateInferenceDataset:
+    """Inference dataset adapter for FastWAM real-robot observations.
+
+    The adapter keeps the robot-side observation contract used by
+    :class:`AlohaInferenceRunner` and returns the FastWAM inference contract:
+    tiled video input, normalized proprioception, and cached text embeddings.
+
+    Args:
+        transforms: Transform configs applied to one observation.
+        norm_stats: Dataset statistics path or dictionary. The runner injects
+            this from the checkpoint work directory during real inference.
+        model_path: Checkpoint work directory injected by the runner. Kept for
+            config compatibility with other inference datasets.
+        img_keys: Observation keys for camera images in HWC layout.
+        statistic_name: Top-level statistics key used for this dataset.
+        device: Optional device to move returned tensors to.
+    """
+
+    def __init__(
+        self,
+        transforms: List[Dict],
+        norm_stats: Optional[Union[str, Dict]] = None,
+        model_path: str = '',
+        img_keys: Optional[List[str]] = None,
+        statistic_name: str = 'private',
+        device: Optional[str] = None,
+    ) -> None:
+        self.transforms = [
+            build_transform_from_cfg(dict(transform))
+            for transform in transforms
+        ]
+        self.norm_stats = self._load_norm_stats(norm_stats)
+        self.model_path = model_path
+        self.img_keys = img_keys or [
+            'cam_high',
+            'cam_left_wrist',
+            'cam_right_wrist',
+        ]
+        self.statistic_name = statistic_name
+        self.device = device
+
+    def __call__(self, data: Dict[str, Any]) -> Dict[str, torch.Tensor]:
+        """Process a raw real-robot observation for FastWAM inference.
+
+        Args:
+            data: Observation dict with HWC camera images, ``qpos`` and
+                ``task_description``.
+
+        Returns:
+            Batch dictionary accepted by ``FastWAMVLA.predict_action``.
+        """
+        inputs = dict(
+            images=self._collect_images(data),
+            task_description=data.get('task_description',
+                                      'No task description provided'),
+            stats=self._get_statistic(),
+            states=np.asarray(data['qpos'], dtype=np.float32),
+        )
+        for transform in self.transforms:
+            inputs = transform(inputs)
+
+        batch = dict(
+            images=self._to_tensor(inputs['images']).unsqueeze(0),
+            states=self._to_tensor(inputs['states']).float().unsqueeze(0),
+            context=self._to_tensor(inputs['context']).unsqueeze(0),
+            context_mask=self._to_tensor(
+                inputs['context_mask']).bool().unsqueeze(0),
+        )
+        return {
+            key: self._move_to_device(value)
+            for key, value in batch.items()
+        }
+
+    @staticmethod
+    def _load_norm_stats(
+            norm_stats: Optional[Union[str, Dict]]) -> Optional[Dict]:
+        if norm_stats is None:
+            return None
+        if isinstance(norm_stats, str):
+            with open(norm_stats, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        return norm_stats
+
+    def _get_statistic(self) -> Dict:
+        if self.norm_stats is None:
+            return {}
+        if self.statistic_name in self.norm_stats:
+            return self.norm_stats[self.statistic_name]
+        if any(key in self.norm_stats for key in ('proprio', 'action')):
+            return self.norm_stats
+        available = ', '.join(sorted(self.norm_stats.keys()))
+        raise KeyError(
+            f"Statistic '{self.statistic_name}' not found in norm_stats. "
+            f'Available keys: {available}')
+
+    def _collect_images(self, data: Dict[str, Any]) -> List[np.ndarray]:
+        images = []
+        for img_key in self.img_keys:
+            if img_key not in data:
+                raise KeyError(f"Image key '{img_key}' not found in inputs!")
+            image = np.asarray(data[img_key])
+            if image.ndim != 3 or image.shape[-1] != 3:
+                raise ValueError(
+                    f"Image '{img_key}' must be HWC RGB/BGR with 3 "
+                    f'channels, got shape {image.shape}')
+            images.append(image.transpose(2, 0, 1))
+        return images
+
+    @staticmethod
+    def _to_tensor(value: Any) -> torch.Tensor:
+        if isinstance(value, torch.Tensor):
+            return value
+        return torch.from_numpy(np.asarray(value))
+
+    def _move_to_device(self, value: torch.Tensor) -> torch.Tensor:
+        if self.device is None:
+            return value
+        return value.to(self.device)

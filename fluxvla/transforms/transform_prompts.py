@@ -424,6 +424,35 @@ class LiberoPromptFromInputs:
 
 
 @TRANSFORMS.register_module()
+class OverrideTaskDescription:
+    """Override a sample task description at transform time.
+
+    This is useful when a dataset's metadata task text is known to be wrong,
+    but the raw dataset should remain immutable for provenance.
+
+    Args:
+        task_description: Replacement task description.
+        task_key: Sample key to overwrite.
+        original_task_key: Optional key used to preserve the original text.
+    """
+
+    def __init__(self,
+                 task_description: str,
+                 task_key: str = 'task_description',
+                 original_task_key: Optional[str] = None) -> None:
+        self.task_description = str(task_description)
+        self.task_key = task_key
+        self.original_task_key = original_task_key
+
+    def __call__(self, inputs: Dict) -> Dict:
+        """Replace ``task_key`` in ``inputs`` with ``task_description``."""
+        if self.original_task_key is not None and self.task_key in inputs:
+            inputs[self.original_task_key] = inputs[self.task_key]
+        inputs[self.task_key] = self.task_description
+        return inputs
+
+
+@TRANSFORMS.register_module()
 class LoadCachedTextEmbedding:
     """Load precomputed text-encoder embeddings from a disk cache.
 

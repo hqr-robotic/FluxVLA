@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import json
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 
 import numpy as np
 import torch
@@ -240,11 +240,13 @@ class DenormalizePrivateAction(DenormalizeLiberoAction):
     mean/std, quantiles, or min_max.
 
     Args:
-        norm_stats (str or Dict): Normalization statistics,
+        norm_stats (str or Dict, optional): Normalization statistics,
             which can be a JSON string or a dictionary
             containing 'mean', 'std', 'q01', 'q99', 'min', and 'max' for each
             feature. If a string, it should be a JSON representation
             of the normalization statistics.
+        statistic_name (str): Top-level statistics key to use.
+            Defaults to 'private'.
         norm_type (str): Type of normalization to use.
             Options: 'mean_std', 'quantile', or 'min_max'.
             Defaults to 'mean_std'.
@@ -269,8 +271,9 @@ class DenormalizePrivateAction(DenormalizeLiberoAction):
     """
 
     def __init__(self,
-                 norm_stats: str,
+                 norm_stats: Optional[Union[str, Dict]] = None,
                  action_dim: int = None,
+                 statistic_name: str = 'private',
                  norm_type: str = 'mean_std',
                  strict: bool = False,
                  denorm_action: bool = True,
@@ -283,6 +286,7 @@ class DenormalizePrivateAction(DenormalizeLiberoAction):
         else:
             self.norm_stats = norm_stats
         self.action_dim = action_dim
+        self.statistic_name = statistic_name
         self.norm_type = norm_type
         self.strict = strict
         self.denorm_action = denorm_action
@@ -300,11 +304,12 @@ class DenormalizePrivateAction(DenormalizeLiberoAction):
             data (Dict): The data to be denormalized, which should
                 contain keys that match the keys in `norm_stats`.
         """
+        action = data.get('action', None)
+        assert action is not None, \
+            f'Action is not found in the data: {data.keys()}'
+        action = action[0]
         if self.norm_stats is not None and self.denorm_action:
-            norm_stats = self.norm_stats['private']
-            action = data.get('action', None)[0]
-            assert action is not None, \
-                f'Action is not found in the data: {data.keys()}'
+            norm_stats = self._get_statistic()
             if self.norm_type == 'quantile':
                 action = self._denormalize_quantile(action,
                                                     norm_stats['action'])
@@ -314,6 +319,16 @@ class DenormalizePrivateAction(DenormalizeLiberoAction):
             else:  # norm_type == 'mean_std'
                 action = self._denormalize(action, norm_stats['action'])
         return action
+
+    def _get_statistic(self) -> Dict:
+        if self.statistic_name in self.norm_stats:
+            return self.norm_stats[self.statistic_name]
+        if 'action' in self.norm_stats:
+            return self.norm_stats
+        available = ', '.join(sorted(self.norm_stats.keys()))
+        raise KeyError(
+            f"Statistic '{self.statistic_name}' not found in norm_stats. "
+            f'Available keys: {available}')
 
 
 @TRANSFORMS.register_module()
