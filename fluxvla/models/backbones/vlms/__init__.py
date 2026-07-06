@@ -18,8 +18,14 @@ from .paligemma import PaliGemma  # noqa: F401, F403
 from .qwen2_5_vl import QWen2_5VL  # noqa: F401, F403
 from .qwen3_vl import Qwen3VL  # noqa: F401, F403
 from .smolvlm import SmolVLMBackbone  # noqa: F401, F403
+from .wan_backbone import WanBaseBackbone  # noqa: F401
 
 try:
-    from .wan_backbone import WanBackbone  # noqa: F401
+    from .wan21_backbone import Wan21Backbone  # noqa: F401
+except ImportError:
+    pass
+
+try:
+    from .wan22_backbone import Wan22Backbone  # noqa: F401
 except ImportError:
     pass
