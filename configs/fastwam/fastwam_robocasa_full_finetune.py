@@ -12,32 +12,57 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# FastWAM world-action model (uncond) finetuned on the real ALOHA garment
-# folding dataset.
+# FastWAM world-action model (uncond) trained on RoboCasa GR1 24-task data.
 
-_ckpt_root = '/root/projects/ryanhu/checkpoints'
+_ckpt_root = './checkpoints'
 
 _frame_window_size = 9
 _action_window_size = 32
 _frame_sample_stride = 4
 
-_data_root_path = [
-    '/root/projects/RealRobot_AgileX_aloha_lerobot/'
-    '20260704_20260704_01_4090_e2e_02',
-    '/root/projects/RealRobot_AgileX_aloha_lerobot/'
-    '20260706_20260706_01_4090_e2e_02',
-]
-_task_description = 'Fold the garment neatly into a compact rectangle.'
-_statistic_name = 'aloha_garment_fold'
+_statistic_name = 'robocasa_gr1_24tasks_30ep'
+_robocasa_data_root = './datasets/robocasa_gr1_24tasks_first30ep'
+_official_gr1_stats_path = (
+    f'{_robocasa_data_root}/official_groot_gr1_dataset_statistics.json')
 _text_embed_cache_dir = (
-    '/root/projects/ryanhu/data/text_embeds_cache/aloha_garment_fold')
+    '/root/projects/ryanhu/data/text_embeds_cache/robocasa_gr1_24tasks_30ep')
+_eval_output_root = (
+    '/root/projects/ryanhu/FluxVLA/FastWAM/evaluate_results/robocas/'
+    'fastwam_robocasa_full_finetune_ddp_stride4_bs32')
+
+_robocasa_task_dirs = [
+    'PnPBottleToCabinetClose',
+    'PnPCanToDrawerClose',
+    'PnPCupToDrawerClose',
+    'PnPMilkToMicrowaveClose',
+    'PnPPotatoToMicrowaveClose',
+    'PnPWineToCabinetClose',
+    'PosttrainPnPNovelFromCuttingboardToBasketSplitA',
+    'PosttrainPnPNovelFromCuttingboardToCardboardboxSplitA',
+    'PosttrainPnPNovelFromCuttingboardToPanSplitA',
+    'PosttrainPnPNovelFromCuttingboardToPotSplitA',
+    'PosttrainPnPNovelFromCuttingboardToTieredbasketSplitA',
+    'PosttrainPnPNovelFromPlacematToBasketSplitA',
+    'PosttrainPnPNovelFromPlacematToBowlSplitA',
+    'PosttrainPnPNovelFromPlacematToPlateSplitA',
+    'PosttrainPnPNovelFromPlacematToTieredshelfSplitA',
+    'PosttrainPnPNovelFromPlateToBowlSplitA',
+    'PosttrainPnPNovelFromPlateToCardboardboxSplitA',
+    'PosttrainPnPNovelFromPlateToPanSplitA',
+    'PosttrainPnPNovelFromPlateToPlateSplitA',
+    'PosttrainPnPNovelFromTrayToCardboardboxSplitA',
+    'PosttrainPnPNovelFromTrayToPlateSplitA',
+    'PosttrainPnPNovelFromTrayToPotSplitA',
+    'PosttrainPnPNovelFromTrayToTieredbasketSplitA',
+    'PosttrainPnPNovelFromTrayToTieredshelfSplitA',
+]
 
 model = dict(
     type='FastWAMVLA',
     pretrained_name_or_path=None,
-    num_views=3,
+    num_views=1,
     frame_window_size=_frame_window_size,
-    proprio_dim=14,
+    proprio_dim=64,
     action_horizon=_action_window_size,
     mot_checkpoint_mixed_attn=True,
     vlm_backbone=dict(
@@ -69,12 +94,12 @@ model = dict(
             fuse_vae_embedding_in_latents=True,
             video_attention_mask_mode='first_frame_causal',
             action_conditioned=False,
-            action_dim=14,
+            action_dim=29,
             action_group_causal_mask_mode='group_diagonal',
             use_gradient_checkpointing=True,
         ),
         action_dit_config=dict(
-            action_dim=14,
+            action_dim=29,
             hidden_dim=1024,
             ffn_dim=4096,
             num_heads=24,
@@ -100,8 +125,8 @@ model = dict(
 inference_model = model.copy()
 
 train_dataloader = dict(
-    per_device_batch_size=16,
-    per_device_num_workers=4,
+    per_device_batch_size=32,
+    per_device_num_workers=8,
     dataset=dict(
         type='DistributedRepeatingDataset',
         name_mappings={
@@ -110,9 +135,13 @@ train_dataloader = dict(
         },
         statistic_keys=['observation.state', 'timestamp', 'action'],
         statistic_name=_statistic_name,
+        dataset_statistics_path=_official_gr1_stats_path,
         datasets=dict(
             type='ParquetDataset',
-            data_root_path=_data_root_path,
+            data_root_path=[
+                f'{_robocasa_data_root}/{task_dir}'
+                for task_dir in _robocasa_task_dirs
+            ],
             transforms=[
                 dict(
                     type='ProcessParquetInputs',
@@ -124,45 +153,33 @@ train_dataloader = dict(
                         'stats',
                         'action_masks',
                     ],
-                    video_keys=[
-                        'observation.images.cam_high',
-                        'observation.images.cam_left_wrist',
-                        'observation.images.cam_right_wrist',
-                    ],
+                    video_keys=['observation.images.ego_view'],
                     name_mappings={
                         'observation.state': ['states'],
                         'actions': ['actions'],
                     },
-                    embodiment_id=0,
+                    embodiment_id=24,
                 ),
-                dict(
-                    type='OverrideTaskDescription',
-                    task_description=_task_description,
-                    original_task_key='raw_task_description',
-                ),
-                dict(
-                    type='ResizeImages',
-                    height=224,
-                    width=224,
-                    backend='torchvision',
-                    scale_to_unit_interval=True,
-                ),
+                dict(type='RobocasaGR1N15Bridge'),
+                dict(type='ResizeImages', height=224, width=224),
                 dict(
                     type='NormalizeImages',
                     means=[0.5, 0.5, 0.5],
                     stds=[0.5, 0.5, 0.5],
+                    scale_to_unit_interval=True,
                 ),
                 dict(
                     type='NormalizeStatesAndActions',
-                    action_dim=14,
-                    state_dim=14,
+                    action_dim=29,
+                    state_dim=64,
                     state_key='proprio',
                     action_key='action',
                     norm_type='min_max',
+                    normalize_states=False,
                 ),
                 dict(
                     type='PrepareVideo',
-                    num_views=3,
+                    num_views=1,
                     frame_window_size=_frame_window_size,
                     tile_direction='horizontal',
                 ),
@@ -184,69 +201,12 @@ train_dataloader = dict(
     ),
 )
 
-inference = dict(
-    type='AlohaInferenceRunner',
-    seed=7,
-    dataset=dict(
-        type='FastWAMPrivateInferenceDataset',
-        statistic_name=_statistic_name,
-        img_keys=['cam_high', 'cam_left_wrist', 'cam_right_wrist'],
-        transforms=[
-            dict(
-                type='ResizeImages',
-                height=224,
-                width=224,
-                backend='torchvision',
-                scale_to_unit_interval=True,
-            ),
-            dict(
-                type='NormalizeImages',
-                means=[0.5, 0.5, 0.5],
-                stds=[0.5, 0.5, 0.5],
-            ),
-            dict(
-                type='NormalizeStatesAndActions',
-                action_dim=14,
-                state_dim=14,
-                state_key='proprio',
-                action_key=None,
-                norm_type='min_max',
-            ),
-            dict(
-                type='PrepareVideo',
-                num_views=3,
-                frame_window_size=1,
-                tile_direction='horizontal',
-            ),
-            dict(
-                type='LoadCachedTextEmbedding',
-                cache_dir=_text_embed_cache_dir,
-                context_len=128,
-                enc_id='wan22ti2v5b',
-            ),
-        ],
-    ),
-    denormalize_action=dict(
-        type='DenormalizePrivateAction',
-        statistic_name=_statistic_name,
-        norm_type='min_max',
-        action_dim=14,
-    ),
-    task_suite_name=_statistic_name,
-    task_descriptions={'1': _task_description},
-    action_chunk=_action_window_size,
-    state_dim=14,
-    publish_rate=30,
-    max_publish_step=10000,
-)
-
 val_dataloader = None
 eval_dataset = None
 
 runner = dict(
     type='DDPTrainRunner',
     max_epochs=10,
-    max_keep_ckpts=10,
     optimizer=dict(lr=1e-4, type='AdamW', weight_decay=1e-2),
     max_grad_norm=1.0,
     collator=dict(
@@ -262,14 +222,7 @@ runner = dict(
             'context',
             'context_mask',
         ],
-        meta_keys=[
-            'task_description',
-            'raw_task_description',
-            'prompt',
-            'info',
-            'stats',
-            'timestamp',
-        ],
+        meta_keys=['task_description', 'prompt', 'info', 'stats', 'timestamp'],
     ),
     sampler=None,
     metric=dict(
@@ -296,5 +249,74 @@ runner = dict(
         seed=42,
         save_video=True,
         video_fps=8,
+    ),
+)
+
+eval = dict(
+    type='RobocasaEvalRunner',
+    model_family='fastwam',
+    task_list=[
+        f'gr1_unified/{task_dir}_GR1ArmsAndWaistFourierHands_Env'
+        for task_dir in _robocasa_task_dirs
+    ],
+    eval_chunk_size=10,
+    max_episode_steps=720,
+    num_trials_per_task=50,
+    num_inference_steps=10,
+    seed=7,
+    unnorm_key=_statistic_name,
+    action_order='n15',
+    save_video=True,
+    dataset=dict(
+        type='RobocasaEvalDataset',
+        unnorm_key=_statistic_name,
+        transforms=[
+            dict(
+                type='ProcessRobocasaEvalInputs',
+                img_key='video.ego_view_pad_res256_freq20',
+                resize_size=224,
+                normalize=True,
+                embodiment_id=24,
+            ),
+            dict(type='RobocasaGR1N15Bridge'),
+            dict(
+                type='NormalizeImages',
+                means=[0.5, 0.5, 0.5],
+                stds=[0.5, 0.5, 0.5],
+            ),
+            dict(
+                type='NormalizeStatesAndActions',
+                action_dim=29,
+                state_dim=64,
+                state_key='proprio',
+                action_key='action',
+                norm_type='min_max',
+                normalize_states=False,
+            ),
+            dict(
+                type='PrepareVideo',
+                num_views=1,
+                frame_window_size=1,
+                tile_direction='horizontal',
+            ),
+            dict(
+                type='LoadCachedTextEmbedding',
+                cache_dir=_text_embed_cache_dir,
+                context_len=128,
+                enc_id='wan22ti2v5b',
+            ),
+        ],
+    ),
+    denormalize_action=dict(
+        type='DenormalizeRobocasaAction',
+        norm_type='min_max',
+        action_dim=29,
+        clip_actions=False,
+        stats_order='fluxvla',
+    ),
+    manager=dict(
+        output_dir=_eval_output_root,
+        num_gpus=8,
+        max_tasks_per_gpu=2,
     ),
 )

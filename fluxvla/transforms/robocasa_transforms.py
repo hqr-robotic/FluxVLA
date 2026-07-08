@@ -447,13 +447,11 @@ class RobocasaEvalDataset:
             'text': data.get('text', ''),
         }
 
-        # Assemble a batch compatible with LiberoParquetEvalDataset.
-        assert 'lang_tokens' in data and 'lang_masks' in data, \
-            'Prompt transform must provide lang_tokens and lang_masks'
-
-        tokens = torch.tensor(data['lang_tokens'])
-        token_mask = data['lang_masks'].tolist() if hasattr(
-            data['lang_masks'], 'tolist') else list(data['lang_masks'])
+        has_tokens = 'lang_tokens' in data and 'lang_masks' in data
+        has_context = 'context' in data and 'context_mask' in data
+        assert has_tokens or has_context, (
+            'Prompt transform must provide either lang_tokens/lang_masks or '
+            'context/context_mask')
 
         # NormalizeImages returns float HWC numpy arrays, but the model expects
         # the CHW (3 * num_imgs, H, W) tensor layout used by the LIBERO eval
@@ -480,9 +478,23 @@ class RobocasaEvalDataset:
         batch = dict(
             images=pixel_values.cuda().unsqueeze(0),
             img_masks=torch.tensor([img_masks]).cuda(),
-            lang_tokens=tokens.unsqueeze(0).cuda(),
-            lang_masks=torch.tensor(token_mask).unsqueeze(0).cuda(),
         )
+
+        if has_tokens:
+            tokens = torch.tensor(data['lang_tokens'])
+            token_mask = data['lang_masks'].tolist() if hasattr(
+                data['lang_masks'], 'tolist') else list(data['lang_masks'])
+            batch['lang_tokens'] = tokens.unsqueeze(0).cuda()
+            batch['lang_masks'] = torch.tensor(token_mask).unsqueeze(0).cuda()
+        if has_context:
+            context = data['context']
+            if not isinstance(context, torch.Tensor):
+                context = torch.as_tensor(context)
+            context_mask = data['context_mask']
+            if not isinstance(context_mask, torch.Tensor):
+                context_mask = torch.as_tensor(context_mask)
+            batch['context'] = context.cuda().unsqueeze(0)
+            batch['context_mask'] = context_mask.bool().cuda().unsqueeze(0)
 
         if 'states' in data:
             batch['states'] = torch.from_numpy(
