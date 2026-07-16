@@ -90,7 +90,8 @@ class BaseTrainRunner(ABC):
                  grad_accumulation_steps: int = 1,
                  evaluator: Optional[Dict] = None,
                  tokenizer: Optional[Dict] = None,
-                 resume_from: Optional[str] = None):
+                 resume_from: Optional[str] = None,
+                 resume_scheduler_state: bool = True):
         from ..utils.builder import (build_collator_from_cfg,
                                      build_metric_from_cfg, build_vla_from_cfg)
 
@@ -167,6 +168,7 @@ class BaseTrainRunner(ABC):
         self.optimizer, self.lr_scheduler = None, None
         self.wandb_mode = os.environ.get('WANDB_MODE', 'online')
         self.resume_from = resume_from
+        self.resume_scheduler_state = self._coerce_bool(resume_scheduler_state)
         # Track if optimizer state was successfully loaded
         self.optimizer_state_loaded = False
         self.num_training_steps = None
@@ -374,6 +376,17 @@ class BaseTrainRunner(ABC):
         """
         ...
 
+    @staticmethod
+    def _coerce_bool(value) -> bool:
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in ('1', 'true', 'yes', 'y', 'on'):
+                return True
+            if normalized in ('0', 'false', 'no', 'n', 'off'):
+                return False
+            raise ValueError(f'Invalid boolean value: {value}')
+        return bool(value)
+
     def resume(self) -> None:
         """Resume training from checkpoint if specified.
 
@@ -389,7 +402,7 @@ class BaseTrainRunner(ABC):
         if overwatch.is_rank_zero():
             overwatch.info(
                 f'Resuming training from checkpoint: {self.resume_from}')
-        checkpoint_info = torch.load(self.resume_from)
+        checkpoint_info = torch.load(self.resume_from, map_location='cpu')
 
         # Restore model state (delegated to subclasses for FSDP/DDP-specific
         # handling)
@@ -434,7 +447,8 @@ class BaseTrainRunner(ABC):
                 dist.barrier()
 
         # Restore scheduler state
-        if ('scheduler_state_dict' in checkpoint_info
+        if (self.resume_scheduler_state
+                and 'scheduler_state_dict' in checkpoint_info
                 and self.lr_scheduler is not None):
             try:
                 self.lr_scheduler.load_state_dict(
@@ -443,12 +457,31 @@ class BaseTrainRunner(ABC):
                     overwatch.info('Scheduler state restored from checkpoint')
             except Exception as e:
                 overwatch.warning(f'Failed to load scheduler state: {e}')
+        elif self.lr_scheduler is not None:
+            self._advance_scheduler_to_resume_step()
 
         if overwatch.is_rank_zero():
             overwatch.info(
                 f'Resumed training from step {self.metric.global_step}, '
                 f'epoch {self.current_epoch}')
         dist.barrier()
+
+    def _advance_scheduler_to_resume_step(self) -> None:
+        target_step = int(self.metric.global_step)
+        if target_step <= 0 or self.optimizer is None:
+            return
+
+        for param_group, lr in zip(self.optimizer.param_groups,
+                                   self.lr_scheduler.get_last_lr()):
+            param_group['lr'] = lr
+
+        for _ in range(target_step):
+            self.lr_scheduler.step(self)
+
+        if overwatch.is_rank_zero():
+            overwatch.info(
+                'Scheduler state skipped; advanced current scheduler to '
+                f'global_step={target_step}, lr={self._get_log_lr():.8g}')
 
     def _should_save_step_checkpoint(self) -> bool:
         """Check if checkpoint should be saved (step-based)."""

@@ -118,6 +118,7 @@ class DDPTrainRunner(BaseTrainRunner):
                  evaluator: Optional[Dict] = None,
                  tokenizer: Optional[Dict] = None,
                  resume_from: Optional[str] = None,
+                 resume_scheduler_state: bool = True,
                  static_graph: bool = True,
                  **kwargs) -> None:
 
@@ -145,7 +146,8 @@ class DDPTrainRunner(BaseTrainRunner):
             grad_accumulation_steps=grad_accumulation_steps,
             evaluator=evaluator,
             tokenizer=tokenizer,
-            resume_from=resume_from)
+            resume_from=resume_from,
+            resume_scheduler_state=resume_scheduler_state)
 
         self.cfg = cfg
         self.args = args
@@ -722,7 +724,7 @@ class DDPTrainRunner(BaseTrainRunner):
         if overwatch.is_rank_zero():
             overwatch.info(
                 f'Resuming training from checkpoint: {self.resume_from}')
-        checkpoint_info = torch.load(self.resume_from)
+        checkpoint_info = torch.load(self.resume_from, map_location='cpu')
 
         if 'model' in checkpoint_info:
             self._load_model_state(checkpoint_info['model'])
@@ -769,7 +771,8 @@ class DDPTrainRunner(BaseTrainRunner):
                 dist.barrier()
 
         # Restore scheduler state (reuse base class logic)
-        if ('scheduler_state_dict' in checkpoint_info
+        if (self.resume_scheduler_state
+                and 'scheduler_state_dict' in checkpoint_info
                 and self.lr_scheduler is not None):
             try:
                 self.lr_scheduler.load_state_dict(
@@ -779,6 +782,8 @@ class DDPTrainRunner(BaseTrainRunner):
             except Exception as e:
                 if overwatch.is_rank_zero():
                     overwatch.warning(f'Failed to load scheduler state: {e}')
+        elif self.lr_scheduler is not None:
+            self._advance_scheduler_to_resume_step()
 
         if overwatch.is_rank_zero():
             overwatch.info(

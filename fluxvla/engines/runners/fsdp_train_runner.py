@@ -89,6 +89,7 @@ class FSDPTrainRunner(BaseTrainRunner):
                  change_key_name: bool = False,
                  tokenizer: Optional[Dict] = None,
                  resume_from: Optional[str] = None,
+                 resume_scheduler_state: bool = True,
                  args=None,
                  *_unused_args,
                  **kwargs) -> None:
@@ -116,7 +117,8 @@ class FSDPTrainRunner(BaseTrainRunner):
             grad_accumulation_steps=grad_accumulation_steps,
             evaluator=evaluator,
             tokenizer=tokenizer,
-            resume_from=resume_from)
+            resume_from=resume_from,
+            resume_scheduler_state=resume_scheduler_state)
         self.cfg = cfg
         self.args = args
         self.max_grad_norm = max_grad_norm
