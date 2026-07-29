@@ -44,7 +44,8 @@ class ParquetDataset(Dataset):
                  train_episode_fraction: float = 1.0,
                  repeat_to_full_length: bool = False,
                  expose_index: bool = False,
-                 expected_dataset_version: Optional[str] = None) -> None:
+                 expected_dataset_version: Optional[str] = None,
+                 pre_transforms: Optional[List[Dict]] = None) -> None:
         """Initialize the Parquet dataset.
 
         Args:
@@ -54,6 +55,8 @@ class ParquetDataset(Dataset):
                 If a list is provided, multiple datasets will be loaded and
                 concatenated.
             transforms (List[Dict]): List of transformation configurations.
+            pre_transforms (List[Dict], optional): Transforms applied to raw
+                parquet metadata before video decoding and input packing.
             batch_transform (Union[dict, ConfigDict, Config]):
                 Configuration for the batch transformation.
             episodes (list[int]): List of episode indices to include
@@ -171,6 +174,8 @@ class ParquetDataset(Dataset):
         self.frame_window_size = frame_window_size
         self.frame_sample_stride = frame_sample_stride
         self.expose_index = expose_index
+        for transform in pre_transforms or []:
+            self.transforms.append(build_transform_from_cfg(transform))
         for transform in transforms:
             self.transforms.append(build_transform_from_cfg(transform))
 
@@ -349,6 +354,7 @@ class ParquetDataset(Dataset):
         if self.frame_window_size > 1:
             frame_timestamps = [data['timestamp']]
             frame_masks = [1]
+            frame_indices = [int(data['frame_index'])]
             for fi in range(1, self.frame_window_size):
                 future_idx = index + fi * self.frame_sample_stride
                 if (future_idx < len(self.dataset)
@@ -358,11 +364,15 @@ class ParquetDataset(Dataset):
                     frame_timestamps.append(
                         self.dataset[future_idx]['timestamp'])
                     frame_masks.append(1)
+                    frame_indices.append(
+                        int(self.dataset[future_idx]['frame_index']))
                 else:
                     frame_timestamps.append(frame_timestamps[-1])
                     frame_masks.append(0)
+                    frame_indices.append(frame_indices[-1])
             data['frame_timestamps'] = frame_timestamps
             data['frame_masks'] = np.array(frame_masks, dtype=np.float32)
+            data['frame_indices'] = np.array(frame_indices, dtype=np.int32)
 
         data['info'] = self.info[dataset_idx]
         data['stats'] = dataset_statistics[self.statistic_name]

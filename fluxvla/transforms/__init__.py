@@ -14,6 +14,7 @@
 
 from .attach_rabc_weight import AttachRABCWeight  # noqa: F401, F403
 from .fast_tokenizer import FASTTokenizer  # noqa: F401, F403
+from .libero_d4rt import LoadLiberoD4RTTracks  # noqa: F401, F403
 from .normalize import *  # noqa: F401, F403
 from .prompters import *  # noqa: F401, F403
 from .robocasa_transforms import (  # noqa: F401, F403

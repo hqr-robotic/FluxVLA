@@ -12,13 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .eagle import EagleBackbone, EagleInferenceBackbone  # noqa: F401, F403
 from .florence2 import Florence2Backbone  # noqa: F401, F403
 from .paligemma import PaliGemma  # noqa: F401, F403
 from .qwen2_5_vl import QWen2_5VL  # noqa: F401, F403
 from .qwen3_vl import Qwen3VL  # noqa: F401, F403
 from .smolvlm import SmolVLMBackbone  # noqa: F401, F403
 from .wan_backbone import WanBaseBackbone  # noqa: F401
+
+try:
+    from .eagle import EagleBackbone  # noqa: F401
+    from .eagle import EagleInferenceBackbone  # noqa: F401
+except (ImportError, OSError):
+    pass
 
 try:
     from .wan21_backbone import Wan21Backbone  # noqa: F401

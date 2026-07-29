@@ -34,6 +34,7 @@ from fluxvla.engines.utils.name_map import str_to_dtype
 from fluxvla.engines.utils.torch_utils import worker_init_function
 from ..utils import (build_evaluator_from_cfg, build_lr_scheduler_from_cfg,
                      build_tokenizer_from_cfg, initialize_overwatch)
+from .fastwam_sampler import FastWAMBatchSampler, GlobalIndexDatasetView
 
 overwatch = initialize_overwatch(__name__)
 
@@ -576,25 +577,53 @@ class BaseTrainRunner(ABC):
         training_eval_dataset = (
             vla_dataset if eval_dataset is None else eval_dataset)
         # Setup dataloader
-        sampler = torch.utils.data.distributed.DistributedSampler(
-            vla_dataset,
-            num_replicas=overwatch.world_size(),
-            rank=overwatch.rank(),
-            shuffle=True,
-            drop_last=False) if self.sampler == 'distributed' else None
+        dataloader_dataset = vla_dataset
+        batch_sampler = None
+        if self.sampler == 'distributed':
+            sampler = torch.utils.data.distributed.DistributedSampler(
+                vla_dataset,
+                num_replicas=overwatch.world_size(),
+                rank=overwatch.rank(),
+                shuffle=True,
+                drop_last=False)
+        elif self.sampler == 'fastwam':
+            sampler_seed = os.environ.get('EXPERIMENT_GLOBAL_SEED')
+            if sampler_seed is None:
+                sampler_seed = getattr(vla_dataset, 'seed', None)
+            if sampler_seed is None:
+                raise ValueError(
+                    'FastWAM sampling requires an explicit training seed.')
+            dataloader_dataset = GlobalIndexDatasetView(vla_dataset)
+            batch_sampler = FastWAMBatchSampler(
+                dataset=dataloader_dataset,
+                seed=int(sampler_seed),
+                batch_size=self.per_device_batch_size,
+                num_processes=overwatch.world_size(),
+                process_index=overwatch.rank())
+            sampler = batch_sampler
+        else:
+            sampler = None
 
         use_workers = self.per_device_num_workers > 0
-        dataloader = DataLoader(
-            vla_dataset,
-            batch_size=self.per_device_batch_size,
-            sampler=sampler,
+        fastwam_sampling = batch_sampler is not None
+        dataloader_kwargs = dict(
+            dataset=dataloader_dataset,
             collate_fn=self.collator,
             num_workers=self.per_device_num_workers,
             worker_init_fn=worker_init_function,
-            generator=self._build_dataloader_generator(),
+            generator=(None if fastwam_sampling else
+                       self._build_dataloader_generator()),
             pin_memory=True,
             prefetch_factor=2 if use_workers else None,
-            persistent_workers=use_workers)
+            persistent_workers=use_workers and not fastwam_sampling)
+        if batch_sampler is None:
+            dataloader = DataLoader(
+                batch_size=self.per_device_batch_size,
+                sampler=sampler,
+                **dataloader_kwargs)
+        else:
+            dataloader = DataLoader(
+                batch_sampler=batch_sampler, **dataloader_kwargs)
 
         # Calculate steps per epoch
         self.steps_per_epoch = self._get_steps_per_epoch(vla_dataset)
@@ -633,14 +662,66 @@ class BaseTrainRunner(ABC):
                 self.current_epoch += 1
                 dataloader_iter = None
 
-    def _run_accumulated_training_step(self, dataloader, dataloader_iter,
-                                       sampler):
+    def _get_accumulation_micro_steps(self, sampler,
+                                      epoch_micro_batch_count: int) -> int:
+        """Return the micro-batch count for the next optimizer step.
+
+        FastWAM lets Accelerate end an accumulation window at the dataloader
+        boundary. The final window may therefore contain fewer micro-batches
+        than ``grad_accumulation_steps``. Gradient scaling is handled
+        separately by ``_get_backward_loss_divisor``.
+
+        Args:
+            sampler: Active sampler or batch sampler.
+            epoch_micro_batch_count: Micro-batches already consumed in the
+                current epoch.
+
+        Returns:
+            Number of micro-batches to consume for the next optimizer step.
+        """
+        if not isinstance(sampler, FastWAMBatchSampler):
+            return self.grad_accumulation_steps
+
+        remaining = len(sampler) - epoch_micro_batch_count
+        if remaining <= 0:
+            raise RuntimeError('FastWAM epoch has no remaining micro-batches.')
+        return min(self.grad_accumulation_steps, remaining)
+
+    def _get_backward_loss_divisor(self) -> int:
+        """Return the loss divisor used before backward.
+
+        FastWAM calls ``training_loss`` through DeepSpeedEngine attribute
+        delegation rather than through ``DeepSpeedEngine.forward``. With the
+        pinned DeepSpeed 0.18.5 runtime, this bypasses the output hook that
+        would divide gradients by GAS. Its effective update is therefore the
+        sum of micro-batch gradients, averaged only across data-parallel
+        ranks. The FastWAM compatibility path preserves that behavior.
+
+        Returns:
+            One for FastWAM parity, otherwise the configured GAS value.
+        """
+        if self.sampler == 'fastwam':
+            return 1
+        return self.grad_accumulation_steps
+
+    def _run_accumulated_training_step(self,
+                                       dataloader,
+                                       dataloader_iter,
+                                       sampler,
+                                       micro_steps: Optional[int] = None):
         """Run one optimizer step made of one or more micro-batches."""
+        if micro_steps is None:
+            micro_steps = self.grad_accumulation_steps
+        if not 1 <= micro_steps <= self.grad_accumulation_steps:
+            raise ValueError(
+                'micro_steps must satisfy 1 <= micro_steps <= '
+                f'{self.grad_accumulation_steps}, got {micro_steps}')
+
         losses = []
-        for micro_step in range(self.grad_accumulation_steps):
+        for micro_step in range(micro_steps):
             batch, dataloader_iter = self._next_batch(dataloader,
                                                       dataloader_iter, sampler)
-            should_step = micro_step == self.grad_accumulation_steps - 1
+            should_step = micro_step == micro_steps - 1
             # Skip the DDP/FSDP gradient all-reduce on non-final
             # micro-steps; gradients are synchronized only once when the
             # accumulated optimizer step is taken.
@@ -680,12 +761,19 @@ class BaseTrainRunner(ABC):
 
             dataloader_iter = None
             epoch_step_count = 0
+            epoch_micro_batch_count = 0
 
             while self.metric.global_step < self.max_steps:
+                micro_steps = self._get_accumulation_micro_steps(
+                    sampler, epoch_micro_batch_count)
                 loss, dataloader_iter = self._run_accumulated_training_step(
-                    dataloader, dataloader_iter, sampler)
+                    dataloader,
+                    dataloader_iter,
+                    sampler,
+                    micro_steps=micro_steps)
                 self._loss_accumulator.append(loss)
                 epoch_step_count += 1
+                epoch_micro_batch_count += micro_steps
 
                 # Update metrics
                 self.metric.commit(
@@ -707,6 +795,7 @@ class BaseTrainRunner(ABC):
                         and epoch_step_count >= self.steps_per_epoch):
                     self.current_epoch += 1
                     epoch_step_count = 0
+                    epoch_micro_batch_count = 0
                     dataloader_iter = None
 
         return self._get_checkpoint_path()
@@ -761,6 +850,7 @@ class BaseTrainRunner(ABC):
 
                 dataloader_iter = iter(dataloader)
                 epoch_step_count = 0
+                epoch_micro_batch_count = 0
                 iter_total = self.steps_per_epoch or len(dataloader)
 
                 with tqdm(
@@ -770,11 +860,17 @@ class BaseTrainRunner(ABC):
                         disable=not overwatch.is_rank_zero()) as iter_pbar:
 
                     while True:
+                        micro_steps = self._get_accumulation_micro_steps(
+                            sampler, epoch_micro_batch_count)
                         loss, dataloader_iter = \
                             self._run_accumulated_training_step(
-                                dataloader, dataloader_iter, sampler)
+                                dataloader,
+                                dataloader_iter,
+                                sampler,
+                                micro_steps=micro_steps)
                         self._loss_accumulator.append(loss)
                         epoch_step_count += 1
+                        epoch_micro_batch_count += micro_steps
 
                         # Update metrics
                         self.metric.commit(
@@ -883,7 +979,7 @@ class BaseTrainRunner(ABC):
             loss_metrics = self._collect_output_loss_metrics(output)
 
         self.metric.commit(loss=loss, **loss_metrics)
-        (loss / self.grad_accumulation_steps).backward()
+        (loss / self._get_backward_loss_divisor()).backward()
 
         # Commit per-dataset metrics
         if overwatch.is_rank_zero() and all(k in output for k in [

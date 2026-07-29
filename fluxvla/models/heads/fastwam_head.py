@@ -22,7 +22,100 @@ from fluxvla.engines import HEADS
 from ..third_party_models.fastwam.modules.schedulers.scheduler_continuous import \
     WanContinuousFlowMatchScheduler  # noqa: E501
 
-__all__ = ['FastWAMHead', 'FastWAMJointHead', 'FastWAMIDMHead']
+__all__ = [
+    'FastWAMHead', 'FastWAMJointHead', 'FastWAMIDMHead', 'FastWAMTrackDecoder'
+]
+
+
+class FastWAMTrackDecoder(nn.Module):
+    """Decode query-wise 2D tracks from final video-token features."""
+
+    def __init__(self,
+                 hidden_dim: int,
+                 decoder_dim: int = 256,
+                 num_views: int = 2,
+                 view_index: int = 0,
+                 tile_direction: str = 'horizontal') -> None:
+        super().__init__()
+        if int(num_views) <= 0:
+            raise ValueError('`num_views` must be positive.')
+        if not 0 <= int(view_index) < int(num_views):
+            raise ValueError('`view_index` must be in [0, num_views).')
+        if tile_direction not in ('horizontal', 'vertical'):
+            raise ValueError(
+                '`tile_direction` must be `horizontal` or `vertical`.')
+        self.num_views = int(num_views)
+        self.view_index = int(view_index)
+        self.tile_direction = tile_direction
+        self.decoder = nn.Sequential(
+            nn.Linear(int(hidden_dim), int(decoder_dim)),
+            nn.SiLU(),
+            nn.Linear(int(decoder_dim), 3),
+        )
+
+    def _select_view_features(self, feature_map: torch.Tensor,
+                              grid_height: int,
+                              grid_width: int) -> torch.Tensor:
+        if self.tile_direction == 'horizontal':
+            if grid_width % self.num_views != 0:
+                raise ValueError(
+                    'Horizontal token-grid width must be divisible by '
+                    f'num_views: {grid_width} % {self.num_views} != 0.')
+            view_width = grid_width // self.num_views
+            start = self.view_index * view_width
+            return feature_map[..., start:start + view_width]
+        if grid_height % self.num_views != 0:
+            raise ValueError(
+                'Vertical token-grid height must be divisible by num_views: '
+                f'{grid_height} % {self.num_views} != 0.')
+        view_height = grid_height // self.num_views
+        start = self.view_index * view_height
+        return feature_map[..., start:start + view_height, :]
+
+    def forward(self, video_tokens: torch.Tensor, grid_size,
+                query_uv: torch.Tensor) -> Dict[str, torch.Tensor]:
+        if video_tokens.ndim != 3:
+            raise ValueError('`video_tokens` must be [B,S,D].')
+        if query_uv.ndim != 3 or query_uv.shape[-1] != 2:
+            raise ValueError('`query_uv` must be [B,N,2].')
+        batch_size, _, hidden_dim = video_tokens.shape
+        latent_frames, grid_height, grid_width = (
+            int(value) for value in grid_size)
+        expected_tokens = latent_frames * grid_height * grid_width
+        if video_tokens.shape[1] != expected_tokens:
+            raise ValueError('Video-token/grid mismatch: '
+                             f'{video_tokens.shape[1]} != {expected_tokens}.')
+        if query_uv.shape[0] != batch_size:
+            raise ValueError('Query/video batch dimensions must match.')
+
+        feature_map = video_tokens.reshape(batch_size, latent_frames,
+                                           grid_height, grid_width,
+                                           hidden_dim).permute(0, 1, 4, 2, 3)
+        feature_map = self._select_view_features(feature_map, grid_height,
+                                                 grid_width)
+        feature_map = feature_map.reshape(batch_size * latent_frames,
+                                          hidden_dim, feature_map.shape[-2],
+                                          feature_map.shape[-1])
+        local_uv = (
+            query_uv.to(device=video_tokens.device, dtype=video_tokens.dtype))
+        sample_grid = local_uv.mul(2.0).sub(1.0)
+        sample_grid = sample_grid[:, None].expand(
+            batch_size, latent_frames, -1,
+            -1).reshape(batch_size * latent_frames, query_uv.shape[1], 1, 2)
+        sampled = F.grid_sample(
+            feature_map,
+            sample_grid,
+            mode='bilinear',
+            padding_mode='border',
+            align_corners=True,
+        )
+        sampled = sampled.squeeze(-1).transpose(1, 2).reshape(
+            batch_size, latent_frames, query_uv.shape[1], hidden_dim)
+        prediction = self.decoder(sampled)
+        return {
+            'delta_uv': prediction[..., :2],
+            'visibility_logit': prediction[..., 2],
+        }
 
 
 @HEADS.register_module()
@@ -59,6 +152,13 @@ class FastWAMHead(nn.Module):
         action_num_train_timesteps: int = 1000,
         loss_lambda_video: float = 1.0,
         loss_lambda_action: float = 1.0,
+        loss_lambda_track_uv: float = 0.0,
+        loss_lambda_track_visibility: float = 0.0,
+        track_decoder_enabled: bool = False,
+        track_decoder_dim: int = 256,
+        track_num_views: int = 2,
+        track_view_index: int = 0,
+        track_tile_direction: str = 'horizontal',
         device: str = 'cpu',
         torch_dtype: torch.dtype = torch.float32,
         *args,
@@ -112,6 +212,22 @@ class FastWAMHead(nn.Module):
         self.torch_dtype = torch_dtype
         self.loss_lambda_video = float(loss_lambda_video)
         self.loss_lambda_action = float(loss_lambda_action)
+        self.loss_lambda_track_uv = float(loss_lambda_track_uv)
+        self.loss_lambda_track_visibility = float(loss_lambda_track_visibility)
+        track_enabled = (
+            bool(track_decoder_enabled) or self.loss_lambda_track_uv > 0.0
+            or self.loss_lambda_track_visibility > 0.0)
+        if track_enabled:
+            self.track_decoder = FastWAMTrackDecoder(
+                hidden_dim=int(self.video_expert.hidden_dim),
+                decoder_dim=int(track_decoder_dim),
+                num_views=int(track_num_views),
+                view_index=int(track_view_index),
+                tile_direction=track_tile_direction,
+            ).to(
+                device=device, dtype=torch_dtype)
+        else:
+            self.track_decoder = None
 
     # ``video_expert`` / ``action_expert`` are stored once inside
     # ``mot.mixtures`` (avoids submodule aliasing that breaks FSDP wrapping);
@@ -220,6 +336,133 @@ class FastWAMHead(nn.Module):
             device=video_loss_token.device, dtype=video_loss_token.dtype)
         valid_sum = valid.sum(dim=1).clamp(min=1.0)
         return (video_loss_token * valid).sum(dim=1) / valid_sum
+
+    def _compute_track_losses(
+        self,
+        video_tokens: torch.Tensor,
+        video_meta: Dict,
+        track_gt_query_uv: Optional[torch.Tensor] = None,
+        track_gt_uv: Optional[torch.Tensor] = None,
+        track_gt_visibility: Optional[torch.Tensor] = None,
+        track_gt_confidence: Optional[torch.Tensor] = None,
+        track_gt_weight: Optional[torch.Tensor] = None,
+        track_gt_mask: Optional[torch.Tensor] = None,
+        track_gt_frame_valid_mask: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> Dict[str, torch.Tensor]:
+        if (self.track_decoder is None or self.loss_lambda_track_uv <= 0.0
+                and self.loss_lambda_track_visibility <= 0.0):
+            return {}
+        required = {
+            'track_gt_query_uv': track_gt_query_uv,
+            'track_gt_uv': track_gt_uv,
+            'track_gt_visibility': track_gt_visibility,
+            'track_gt_confidence': track_gt_confidence,
+            'track_gt_weight': track_gt_weight,
+            'track_gt_mask': track_gt_mask,
+            'track_gt_frame_valid_mask': track_gt_frame_valid_mask,
+        }
+        missing = [key for key, value in required.items() if value is None]
+        if missing:
+            raise ValueError(
+                f'Track auxiliary loss is enabled but fields are missing: '
+                f'{missing}')
+
+        query_uv = track_gt_query_uv.to(
+            device=video_tokens.device, dtype=torch.float32)
+        target_uv = track_gt_uv.to(
+            device=video_tokens.device, dtype=torch.float32)
+        target_visibility = track_gt_visibility.to(
+            device=video_tokens.device, dtype=torch.float32)
+        confidence = track_gt_confidence.to(
+            device=video_tokens.device, dtype=torch.float32)
+        uv_weight = track_gt_weight.to(
+            device=video_tokens.device, dtype=torch.float32)
+        valid_mask = track_gt_mask.to(
+            device=video_tokens.device, dtype=torch.bool)
+        frame_valid = track_gt_frame_valid_mask.to(
+            device=video_tokens.device, dtype=torch.bool)
+        if target_uv.ndim != 4 or target_uv.shape[-1] != 2:
+            raise ValueError('`track_gt_uv` must be [B,T,N,2].')
+
+        latent_frames = int(video_meta['grid_size'][0])
+        expected_raw_frames = 1 + (latent_frames - 1) * int(
+            self.temporal_downsample_factor)
+        if target_uv.shape[1] != expected_raw_frames:
+            raise ValueError('Track/video temporal mismatch: '
+                             f'track_frames={target_uv.shape[1]}, '
+                             f'expected={expected_raw_frames}.')
+        selected_indices = torch.zeros(
+            (target_uv.shape[0], latent_frames),
+            device=video_tokens.device,
+            dtype=torch.long,
+        )
+        latent_valid = torch.zeros_like(selected_indices, dtype=torch.bool)
+        temporal_factor = int(self.temporal_downsample_factor)
+        for latent_index in range(latent_frames):
+            if latent_index == 0:
+                group_start, group_end = 0, 1
+            else:
+                group_start = 1 + (latent_index - 1) * temporal_factor
+                group_end = min(group_start + temporal_factor,
+                                target_uv.shape[1])
+            group_valid = frame_valid[:, group_start:group_end]
+            offsets = torch.arange(
+                group_end - group_start,
+                device=video_tokens.device,
+                dtype=torch.long,
+            ).unsqueeze(0)
+            valid_offsets = torch.where(group_valid, offsets,
+                                        torch.full_like(offsets, -1))
+            last_valid_offset = valid_offsets.max(dim=1).values
+            latent_valid[:, latent_index] = last_valid_offset >= 0
+            selected_indices[:, latent_index] = group_start + \
+                last_valid_offset.clamp(min=0)
+
+        def gather_temporal(value: torch.Tensor) -> torch.Tensor:
+            index_shape = [value.shape[0], latent_frames] + [1] * (
+                value.ndim - 2)
+            expand_shape = [value.shape[0], latent_frames] + list(
+                value.shape[2:])
+            indices = selected_indices.reshape(index_shape).expand(
+                expand_shape)
+            return value.gather(1, indices)
+
+        target_uv = gather_temporal(target_uv)
+        target_visibility = gather_temporal(target_visibility)
+        confidence = gather_temporal(confidence)
+        uv_weight = gather_temporal(uv_weight)
+        valid_mask = gather_temporal(valid_mask)
+        valid_mask &= latent_valid[:, :, None]
+
+        prediction = self.track_decoder(
+            video_tokens=video_tokens,
+            grid_size=video_meta['grid_size'],
+            query_uv=query_uv.to(dtype=video_tokens.dtype),
+        )
+        predicted_uv = query_uv[:, None] + prediction['delta_uv'].float()
+        uv_error = F.smooth_l1_loss(
+            predicted_uv, target_uv, reduction='none').mean(dim=-1)
+        uv_weight = uv_weight * valid_mask.to(dtype=torch.float32)
+        loss_track_uv = (uv_error *
+                         uv_weight).sum() / uv_weight.sum().clamp(min=1.0)
+
+        visibility_weight = confidence * valid_mask.to(dtype=torch.float32)
+        visibility_error = F.binary_cross_entropy_with_logits(
+            prediction['visibility_logit'].float(),
+            target_visibility,
+            reduction='none',
+        )
+        loss_track_visibility = (visibility_error * visibility_weight).sum(
+        ) / visibility_weight.sum().clamp(min=1.0)
+        loss_track = (
+            self.loss_lambda_track_uv * loss_track_uv +
+            self.loss_lambda_track_visibility * loss_track_visibility)
+        return {
+            'loss_track': loss_track,
+            'loss_track_uv': loss_track_uv,
+            'loss_track_visibility': loss_track_visibility,
+        }
 
     @torch.no_grad()
     def _predict_joint_noise(
@@ -496,11 +739,28 @@ class FastWAMHead(nn.Module):
         loss_total = (
             self.loss_lambda_video * loss_video +
             self.loss_lambda_action * loss_action)
-        return {
+        track_losses = self._compute_track_losses(
+            video_tokens=tokens_out['video'],
+            video_meta=video_pre['meta'],
+            **kwargs,
+        )
+        if track_losses:
+            loss_total = loss_total + track_losses['loss_track']
+        output = {
             'loss': loss_total,
             'loss_video': (self.loss_lambda_video * loss_video).detach(),
             'loss_action': (self.loss_lambda_action * loss_action).detach(),
         }
+        if track_losses:
+            output.update({
+                'loss_track':
+                track_losses['loss_track'].detach(),
+                'loss_track_uv':
+                track_losses['loss_track_uv'].detach(),
+                'loss_track_visibility':
+                track_losses['loss_track_visibility'].detach(),
+            })
+        return output
 
     # ------------------------------------------------------------------
     # Action inference (ported from FastWAM.infer_action denoising loop)
@@ -1155,11 +1415,28 @@ class FastWAMIDMHead(FastWAMJointHead):
         loss_total = (
             self.loss_lambda_video * loss_video +
             self.loss_lambda_action * loss_action)
-        return {
+        track_losses = self._compute_track_losses(
+            video_tokens=pred_video_tokens,
+            video_meta=video_pre_noisy['meta'],
+            **kwargs,
+        )
+        if track_losses:
+            loss_total = loss_total + track_losses['loss_track']
+        output = {
             'loss': loss_total,
             'loss_video': (self.loss_lambda_video * loss_video).detach(),
             'loss_action': (self.loss_lambda_action * loss_action).detach(),
         }
+        if track_losses:
+            output.update({
+                'loss_track':
+                track_losses['loss_track'].detach(),
+                'loss_track_uv':
+                track_losses['loss_track_uv'].detach(),
+                'loss_track_visibility':
+                track_losses['loss_track_visibility'].detach(),
+            })
+        return output
 
     @torch.no_grad()
     def predict_video_action(

@@ -205,6 +205,9 @@ class ProcessParquetInputs():
             inputs['embodiment_ids'] = np.array(self.embodiment_id)
         if 'frame_masks' in data:
             inputs['frame_masks'] = data['frame_masks']
+        for key, value in data.items():
+            if key.startswith('track_gt_'):
+                inputs[key] = np.asarray(value)
         if 'sample_weight' in data:
             inputs['sample_weight'] = np.asarray(
                 data['sample_weight'], dtype=np.float32)

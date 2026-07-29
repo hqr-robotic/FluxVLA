@@ -14,6 +14,8 @@
 #
 # FastWAM world-action model (idm) trained on all LIBERO suites.
 
+import os
+
 _ckpt_root = './checkpoints'
 _tokenizer = _ckpt_root + '/fastwam_base_full/tokenizer'
 _text_prompt_template = (
@@ -23,13 +25,15 @@ _text_prompt_template = (
 _frame_window_size = 9
 _action_window_size = 32
 _frame_sample_stride = 4
+seed = 42
+_text_embed_cache_dir = os.environ.get('FASTWAM_TEXT_CACHE_DIR')
 
 # Train jointly on every no-noops LIBERO suite.
 _data_root_paths = [
-    'datasets/libero_10_no_noops_lerobotv2.1',
-    'datasets/libero_goal_no_noops_lerobotv2.1',
-    'datasets/libero_object_no_noops_lerobotv2.1',
     'datasets/libero_spatial_no_noops_lerobotv2.1',
+    'datasets/libero_object_no_noops_lerobotv2.1',
+    'datasets/libero_goal_no_noops_lerobotv2.1',
+    'datasets/libero_10_no_noops_lerobotv2.1',
 ]
 _statistic_name = 'libero_all_no_noops'
 
@@ -42,10 +46,11 @@ model = dict(
     frame_window_size=_frame_window_size,
     proprio_dim=8,
     action_horizon=_action_window_size,
-    mot_checkpoint_mixed_attn=True,
+    mot_checkpoint_mixed_attn=False,
     vlm_backbone=dict(
         type='Wan22Backbone',
-        text_embed_cache_dir=None,
+        text_embed_cache_dir=_text_embed_cache_dir,
+        text_embed_cache_required=False,
         text_embed_cache_context_len=128,
         text_embed_cache_enc_id='wan22ti2v5b',
         text_embed_cache_size=256,
@@ -75,7 +80,7 @@ model = dict(
             action_conditioned=False,
             action_dim=7,
             action_group_causal_mask_mode='group_diagonal',
-            use_gradient_checkpointing=True,
+            use_gradient_checkpointing=False,
         ),
         action_dit_config=dict(
             action_dim=7,
@@ -87,7 +92,7 @@ model = dict(
             text_dim=4096,
             freq_dim=256,
             eps=1.0e-06,
-            use_gradient_checkpointing=True,
+            use_gradient_checkpointing=False,
         ),
         video_scheduler=dict(
             train_shift=5.0, infer_shift=5.0, num_train_timesteps=1000),
@@ -97,13 +102,12 @@ model = dict(
     ),
 )
 
-# Training and evaluation encode unseen prompts online, then reuse a
-# per-process CPU-memory LRU cache without reading or writing cache files.
+# Training and evaluation encode unseen prompts online, then reuse the
+# process-local LRU and persist embeddings under FASTWAM_TEXT_CACHE_DIR.
 inference_model = model.copy()
 
 train_dataloader = dict(
-    # Microbatch 4 x 4 accumulation steps preserves the original
-    # per-device effective batch size of 16 without the forward-pass OOM.
+    # Current FastWAM working-tree recipe: physical batch 4, GAS 4.
     per_device_batch_size=4,
     per_device_num_workers=8,
     dataset=dict(
@@ -189,9 +193,15 @@ train_dataloader = dict(
 )
 
 runner = dict(
-    type='DDPTrainRunner',
+    type='FastWAMDeepSpeedTrainRunner',
     max_epochs=10,
-    optimizer=dict(lr=1e-4, type='AdamW', weight_decay=1e-2),
+    optimizer=dict(
+        lr=1e-4,
+        type='AdamW',
+        weight_decay=1e-2,
+        betas=(0.9, 0.95),
+        eps=1e-8,
+    ),
     max_grad_norm=1.0,
     collator=dict(
         type='DictCollator',
@@ -208,10 +218,10 @@ runner = dict(
         ],
         meta_keys=['task_description', 'info', 'stats', 'timestamp'],
     ),
-    sampler=None,
+    sampler='source',
     metric=dict(
         type='VLAMetric',
-        active_trackers=('jsonl', 'wandb'),
+        active_trackers=('jsonl', ),
         run_dir='work_dirs',
         window_size=1,
     ),
@@ -226,7 +236,8 @@ runner = dict(
     enable_mixed_precision_training=True,
     grad_accumulation_steps=4,
     mixed_precision_dtype='bf16',
-    static_graph=False,
+    log_every=10,
+    save_every=2000,
     evaluator=dict(
         type='training-eval',
         eval_every=200,

@@ -12,11 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from pathlib import Path
 from typing import Callable, Dict, Optional, Tuple
 
 import numpy as np
 import torch
 from PIL import Image
+from safetensors.torch import load_file
 
 from fluxvla.engines import HEADS, VLAS, initialize_overwatch
 from fluxvla.engines.utils.name_map import str_to_dtype
@@ -177,6 +179,11 @@ class FastWAMVLA(BaseVLA):
                                                      'cpu'),
             text_embed_prompt_template=backbone_cfg.get(
                 'text_embed_prompt_template'),
+            text_embed_cache_required=bool(
+                backbone_cfg.get('text_embed_cache_required', False)),
+            text_encoder_checkpoint_path=self.pretrained_name_or_path,
+            tokenizer_path=self._resolve_packaged_tokenizer_path(
+                required=backbone_cfg.get('text_embed_cache_dir') is not None),
             device=device,
             torch_dtype=self.torch_dtype,
             freeze=True,
@@ -185,6 +192,7 @@ class FastWAMVLA(BaseVLA):
         video_scheduler = head_cfg.get('video_scheduler') or {}
         action_scheduler = head_cfg.get('action_scheduler') or {}
         loss = head_cfg.get('loss') or {}
+        track_num_views = int(loss.get('track_num_views', self.num_views or 1))
         head_cls = HEADS.get(head_type)
         if head_cls is None:
             raise KeyError(
@@ -206,10 +214,84 @@ class FastWAMVLA(BaseVLA):
                 action_scheduler.get('num_train_timesteps', 1000)),
             loss_lambda_video=float(loss.get('lambda_video', 1.0)),
             loss_lambda_action=float(loss.get('lambda_action', 1.0)),
+            loss_lambda_track_uv=float(loss.get('lambda_track_uv', 0.0)),
+            loss_lambda_track_visibility=float(
+                loss.get('lambda_track_visibility', 0.0)),
+            track_decoder_enabled=bool(
+                loss.get('track_decoder_enabled', False)),
+            track_decoder_dim=int(loss.get('track_decoder_dim', 256)),
+            track_num_views=track_num_views,
+            track_view_index=int(loss.get('track_view_index', 0)),
+            track_tile_direction=str(
+                loss.get('track_tile_direction', 'horizontal')),
             device=device,
             torch_dtype=self.torch_dtype,
         )
         return backbone, head
+
+    def _resolve_packaged_tokenizer_path(
+        self,
+        required: bool,
+    ) -> Optional[str]:
+        """Resolve the tokenizer shipped beside the full checkpoint.
+
+        Args:
+            required: Whether missing provenance must fail immediately.
+
+        Returns:
+            Packaged tokenizer directory, or ``None`` when optional.
+        """
+        if self.pretrained_name_or_path is None:
+            return None
+        checkpoint = Path(self.pretrained_name_or_path).expanduser()
+        tokenizer_path = checkpoint.parent / 'tokenizer'
+        if not tokenizer_path.is_dir():
+            if required:
+                raise FileNotFoundError(
+                    'FastWAM text-cache provenance requires the packaged '
+                    f'tokenizer directory: {tokenizer_path}.')
+            return None
+        return str(tokenizer_path)
+
+    def from_pretrained(self):
+        """Load a complete base checkpoint plus an optional new track head."""
+        if self.vla_head.track_decoder is None:
+            return super().from_pretrained()
+        if self.pretrained_name_or_path is None:
+            return
+        if not str(self.pretrained_name_or_path).endswith('.safetensors'):
+            raise ValueError(
+                'FastWAM track auxiliary training requires a complete '
+                'safetensors base checkpoint.')
+        pretrained_weights = load_file(
+            self.pretrained_name_or_path, device='cpu')
+        allowed_prefix = 'vla_head.track_decoder.'
+        expected_track_keys = {
+            key
+            for key in self.state_dict() if key.startswith(allowed_prefix)
+        }
+        checkpoint_track_keys = {
+            key
+            for key in pretrained_weights if key.startswith(allowed_prefix)
+        }
+        if checkpoint_track_keys and checkpoint_track_keys != \
+                expected_track_keys:
+            missing_track = sorted(expected_track_keys - checkpoint_track_keys)
+            unexpected_track = sorted(checkpoint_track_keys -
+                                      expected_track_keys)
+            raise RuntimeError(
+                'Partial FastWAM track decoder checkpoint: '
+                f'missing={missing_track}, unexpected={unexpected_track}')
+        if checkpoint_track_keys == expected_track_keys:
+            self.load_state_dict(pretrained_weights, strict=True)
+            return
+
+        load_result = self.load_state_dict(pretrained_weights, strict=False)
+        missing_keys = set(load_result.missing_keys)
+        if missing_keys != expected_track_keys or load_result.unexpected_keys:
+            raise RuntimeError('FastWAM track checkpoint mismatch: '
+                               f'missing={sorted(missing_keys)}, '
+                               f'unexpected={load_result.unexpected_keys}')
 
     # ------------------------------------------------------------------
     # Training forward
@@ -272,6 +354,8 @@ class FastWAMVLA(BaseVLA):
             raise ValueError(
                 f'Video T must be > 1 for action-conditioned training, '
                 f'got {num_frames}')
+        images = images.to(
+            device=self.device, dtype=self.torch_dtype, non_blocking=True)
 
         vlm_outputs = self.vlm_backbone(
             video=images,
@@ -292,6 +376,10 @@ class FastWAMVLA(BaseVLA):
         if frame_masks is not None:
             image_is_pad = ~frame_masks.to(dtype=torch.bool)
 
+        track_kwargs = {
+            key: value
+            for key, value in kwargs.items() if key.startswith('track_gt_')
+        }
         return self.vla_head(
             input_latents=input_latents,
             context=context,
@@ -300,6 +388,7 @@ class FastWAMVLA(BaseVLA):
             action_is_pad=action_is_pad,
             image_is_pad=image_is_pad,
             proprio=proprio,
+            **track_kwargs,
         )
 
     # ------------------------------------------------------------------
