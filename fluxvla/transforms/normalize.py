@@ -274,6 +274,8 @@ class DenormalizePrivateAction(DenormalizeLiberoAction):
             This is useful for tasks where the gripper action
             is represented in a way that requires inversion
             (e.g., opening vs. closing).
+        clip_normalized_action (bool): If True, clip continuous normalized
+            actions to [-1, 1] before denormalization.
     """
 
     def __init__(self,
@@ -287,7 +289,8 @@ class DenormalizePrivateAction(DenormalizeLiberoAction):
                  action_norm_mask: List[bool] = None,
                  statistic_name: str = 'private',
                  discrete_action_dims: List[int] = None,
-                 discrete_norm_type: str = 'min_max'):
+                 discrete_norm_type: str = 'min_max',
+                 clip_normalized_action: bool = False):
         if isinstance(norm_stats, str):
             with open(norm_stats, 'r', encoding='utf-8') as f:
                 self.norm_stats = json.load(f)
@@ -302,6 +305,7 @@ class DenormalizePrivateAction(DenormalizeLiberoAction):
         self.discrete_action_dims = (
             list(discrete_action_dims) if discrete_action_dims else None)
         self.discrete_norm_type = discrete_norm_type
+        self.clip_normalized_action = bool(clip_normalized_action)
 
     def __call__(self, data: Dict) -> Dict:
         """Denormalize the data using the provided statistics.
