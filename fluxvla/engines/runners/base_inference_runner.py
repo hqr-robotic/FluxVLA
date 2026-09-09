@@ -74,6 +74,9 @@ class BaseInferenceRunner:
             model loading is skipped and inference is delegated to a ZMQ
             server.  Keys: ``server_host``, ``server_port``, ``timeout_s``,
             ``serializer``, ``compress``, ``enable_profiling``.
+        requires_checkpoint (bool): Require a checkpoint and dataset
+            statistics. Set to False for checkpoint-free API policies.
+        model_build_device (str): Optional local model device override.
     """
 
     def __init__(self,
@@ -98,6 +101,8 @@ class BaseInferenceRunner:
                  enable_mixed_precision: bool = True,
                  keep_params_fp32: bool = False,
                  remote_inference: Dict = None,
+                 requires_checkpoint: bool = True,
+                 model_build_device: str = None,
                  **kwargs):
         from fluxvla.engines import (build_dataset_from_cfg,
                                      build_transform_from_cfg,
@@ -105,6 +110,8 @@ class BaseInferenceRunner:
 
         self.ckpt_path = ckpt_path
         self._use_remote = remote_inference is not None
+        inference_model_cfg = (
+            cfg.get('inference_model') if cfg is not None else None)
 
         if self._use_remote:
             self.dataset = None
@@ -124,7 +131,7 @@ class BaseInferenceRunner:
             dataset['model_path'] = os.path.dirname(os.path.dirname(ckpt_path))
             self.dataset = build_dataset_from_cfg(dataset)
 
-            self.vla = build_vla_from_cfg(cfg.inference_model)
+            self.vla = build_vla_from_cfg(inference_model_cfg)
             assert Path.exists(Path(ckpt_path)), \
                 f'Checkpoint path {ckpt_path} does not exist!'
             if ckpt_path.endswith('.safetensors'):
@@ -136,6 +143,18 @@ class BaseInferenceRunner:
                 else:
                     state_dict = checkpoint
             self.vla.load_state_dict(state_dict, strict=True)
+        elif not requires_checkpoint:
+            if inference_model_cfg is None:
+                raise ValueError(
+                    'Checkpoint-free inference requires cfg.inference_model')
+            if dataset is None or denormalize_action is None:
+                raise ValueError(
+                    'Checkpoint-free inference requires dataset and '
+                    'denormalize_action configs')
+            self.denormalize_action = build_transform_from_cfg(
+                denormalize_action)
+            self.dataset = build_dataset_from_cfg(dataset)
+            self.vla = build_vla_from_cfg(inference_model_cfg)
         else:
             self.dataset = None
             self.denormalize_action = None
@@ -165,6 +184,8 @@ class BaseInferenceRunner:
         self.mixed_precision_dtype = str_to_dtype(mixed_precision_dtype)
         self.enable_mixed_precision = enable_mixed_precision
         self.keep_params_fp32 = bool(keep_params_fp32)
+        self.requires_checkpoint = bool(requires_checkpoint)
+        self.model_build_device = model_build_device
 
         # Action context: SimpleNamespace shared between _predict_action,
         # _postprocess_actions, and _execute_actions within one iteration.
@@ -285,7 +306,16 @@ class BaseInferenceRunner:
             overwatch.info(f'Remote server OK at {self._server_address}. '
                            f'Seed set to {self.seed}')
         else:
+            if self.vla is None:
+                raise RuntimeError(
+                    'No local model was loaded. Provide ckpt_path or set '
+                    'requires_checkpoint=False with cfg.inference_model.')
             self.vla.eval()
+            if self.model_build_device == 'cpu':
+                self.vla.to(device='cpu')
+                overwatch.info('Checkpoint-free model initialized on CPU. '
+                               f'Seed set to {self.seed}')
+                return
             if self.enable_mixed_precision and not self.keep_params_fp32:
                 self.vla.to(device='cuda', dtype=self.mixed_precision_dtype)
             else:

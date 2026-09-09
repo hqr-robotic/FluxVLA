@@ -223,6 +223,14 @@ class AlohaInferenceRunner(BaseInferenceRunner):
 
     def _move_to_prepare_pose(self):
         """Move robot to predefined preparation pose."""
+        if self.disable_puppet_arm:
+            from ..utils import initialize_overwatch
+
+            overwatch = initialize_overwatch(__name__)
+            overwatch.warning(
+                'Skipping ALOHA prepare pose because arm commands are '
+                'disabled.')
+            return
         if self.prepare_pose is not None:
             left_pose, right_pose = self.prepare_pose
             self.ros_operator.move_to_joints(left_pose, right_pose)

@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import json
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
@@ -100,6 +100,41 @@ class IdentityLiberoAction:
         action = action[..., :self.action_dim]
         if self.clip:
             action = np.clip(action, -1.0, 1.0)
+        return action
+
+
+@TRANSFORMS.register_module()
+class IdentityRobotAction:
+    """Return native robot actions without dataset-stat denormalization.
+
+    Args:
+        norm_stats: Ignored compatibility argument injected by runners.
+        action_dim: Number of action dimensions to retain.
+        squeeze_batch: Remove a singleton leading batch dimension.
+    """
+
+    def __init__(self,
+                 norm_stats: Any = None,
+                 action_dim: Optional[int] = None,
+                 squeeze_batch: bool = True) -> None:
+        del norm_stats
+        self.action_dim = action_dim
+        self.squeeze_batch = bool(squeeze_batch)
+
+    def __call__(self, data: Dict) -> np.ndarray:
+        """Convert model output to a native float32 action array."""
+        action = np.asarray(data['action'], dtype=np.float32)
+        if self.squeeze_batch and action.ndim == 3 and action.shape[0] == 1:
+            action = action[0]
+        if action.ndim != 2:
+            raise ValueError(
+                f'Expected action shape (T, A), got {action.shape}')
+        if self.action_dim is not None:
+            if action.shape[-1] < self.action_dim:
+                raise ValueError(
+                    f'Expected at least {self.action_dim} action values, '
+                    f'got {action.shape[-1]}')
+            action = action[..., :self.action_dim]
         return action
 
 

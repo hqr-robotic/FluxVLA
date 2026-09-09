@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""OpenAI Responses API policy for checkpoint-free robot evaluation."""
+"""OpenAI Responses API policy for checkpoint-free robot inference."""
 
 from __future__ import annotations
 import base64
@@ -63,14 +63,37 @@ supported match. Include a short note describing what you see and why you
 chose the target. Do not guess object coordinates from simulator-only
 metadata; use the images and the reported robot state."""
 
+DEFAULT_ALOHA_SYSTEM_PROMPT = """You control an ALOHA dual-arm robot using
+three RGB cameras: one front camera, one left-wrist camera, and one
+right-wrist camera. At every turn you receive the current 14-dimensional
+joint state. Each arm has six revolute joints followed by one gripper joint.
+Use exactly one move_joints tool call to make a small, deliberate correction
+toward the instruction, then inspect the next observation before continuing.
+
+Joint deltas are relative to the reported state and are measured in radians.
+Use one arm unless the task explicitly needs both. Prefer corrections below
+0.05 radians; larger corrections are allowed only when the direction is clear
+from consecutive observations. Keep the inactive arm stationary. Use the
+corresponding wrist camera for final grasp alignment and the front camera for
+global context. Open the gripper before approaching, close only when the
+object is between the fingertips, lift after grasping, and open only at the
+destination. Never invent Cartesian coordinates or bypass the configured
+joint and step limits. If visual evidence is ambiguous, hold position or make
+the smallest reversible motion. Include a short note explaining the observed
+effect of the previous motion and the next correction."""
+
+_LIBERO_CONTROL_MODE = 'libero_eef_delta'
+_ALOHA_CONTROL_MODE = 'aloha_joint_delta'
+
 
 @VLAS.register_module()
 class OpenAIResponsesVLA(nn.Module):
     """Inference-only VLA backed by the OpenAI Responses API.
 
-    The model emits a high-level absolute Cartesian ``move_to`` tool call.
-    This wrapper converts that target into a short chunk of normalized LIBERO
-    OSC pose actions. It intentionally has no local trainable weights.
+    The model emits a constrained tool call which this wrapper converts to a
+    native robot action chunk. LIBERO uses Cartesian delta control, while
+    ALOHA uses bounded joint deltas interpolated into absolute joint targets.
+    The wrapper intentionally has no local trainable weights.
     """
 
     def __init__(self,
@@ -94,7 +117,12 @@ class OpenAIResponsesVLA(nn.Module):
                  workspace_bounds: Sequence[Sequence[float]] = ((-0.45, 0.45),
                                                                 (-0.45, 0.45),
                                                                 (-0.05, 1.40)),
-                 system_prompt: str = DEFAULT_LIBERO_SYSTEM_PROMPT,
+                 control_mode: str = _LIBERO_CONTROL_MODE,
+                 aloha_max_joint_delta: float = 0.12,
+                 aloha_joint_limits: Sequence[Sequence[float]] = None,
+                 aloha_gripper_open: float = 0.08,
+                 aloha_gripper_closed: float = -0.01,
+                 system_prompt: str = None,
                  task_visual_hints: Dict[str, str] = None,
                  device: str = None,
                  torch_dtype=None) -> None:
@@ -108,6 +136,28 @@ class OpenAIResponsesVLA(nn.Module):
             raise ValueError('position_action_scale must be positive')
         if len(workspace_bounds) != 3:
             raise ValueError('workspace_bounds must contain x/y/z bounds')
+        if control_mode not in {_LIBERO_CONTROL_MODE, _ALOHA_CONTROL_MODE}:
+            raise ValueError(f'Unsupported control_mode: {control_mode!r}')
+        if aloha_max_joint_delta <= 0:
+            raise ValueError('aloha_max_joint_delta must be positive')
+        if aloha_joint_limits is None:
+            aloha_joint_limits = [(-math.pi, math.pi)] * 12
+        if len(aloha_joint_limits) != 12:
+            raise ValueError('aloha_joint_limits must contain 12 bounds')
+        normalized_joint_limits = []
+        for bounds in aloha_joint_limits:
+            if len(bounds) != 2:
+                raise ValueError(
+                    'Each ALOHA joint limit must contain lower and upper')
+            lower, upper = float(bounds[0]), float(bounds[1])
+            if not math.isfinite(lower) or not math.isfinite(upper):
+                raise ValueError('ALOHA joint limits must be finite')
+            if lower >= upper:
+                raise ValueError(
+                    'ALOHA joint-limit lower bound must be below upper')
+            normalized_joint_limits.append((lower, upper))
+        if aloha_gripper_closed >= aloha_gripper_open:
+            raise ValueError('ALOHA closed gripper value must be below open')
 
         self.model = model
         self.base_url = base_url.rstrip('/')
@@ -128,6 +178,15 @@ class OpenAIResponsesVLA(nn.Module):
         self.gripper_settle_steps = int(gripper_settle_steps)
         self.workspace_bounds = tuple((float(bounds[0]), float(bounds[1]))
                                       for bounds in workspace_bounds)
+        self.control_mode = control_mode
+        self.aloha_max_joint_delta = float(aloha_max_joint_delta)
+        self.aloha_joint_limits = tuple(normalized_joint_limits)
+        self.aloha_gripper_open = float(aloha_gripper_open)
+        self.aloha_gripper_closed = float(aloha_gripper_closed)
+        if system_prompt is None:
+            system_prompt = (
+                DEFAULT_ALOHA_SYSTEM_PROMPT if control_mode
+                == _ALOHA_CONTROL_MODE else DEFAULT_LIBERO_SYSTEM_PROMPT)
         self.system_prompt = system_prompt
         self.task_visual_hints = {
             str(task).strip().lower(): str(hint)
@@ -152,6 +211,9 @@ class OpenAIResponsesVLA(nn.Module):
 
     @property
     def tools(self) -> List[Dict[str, Any]]:
+        if self.control_mode == _ALOHA_CONTROL_MODE:
+            return self._aloha_tools()
+
         x_bounds, y_bounds, z_bounds = self.workspace_bounds
         description = (
             'Move the robot end effector to an absolute Cartesian target. '
@@ -200,6 +262,81 @@ class OpenAIResponsesVLA(nn.Module):
                 'additionalProperties': False,
             },
             'strict': False,
+        }]
+
+    @property
+    def tool_name(self) -> str:
+        """Return the function name required for the configured robot."""
+        if self.control_mode == _ALOHA_CONTROL_MODE:
+            return 'move_joints'
+        return 'move_to'
+
+    def _aloha_tools(self) -> List[Dict[str, Any]]:
+        """Build the bounded ALOHA joint-delta tool schema."""
+        delta_description = (
+            'Six relative joint changes in radians, ordered from the base '
+            'joint to the wrist. Each value is clipped to '
+            f'+/-{self.aloha_max_joint_delta:.3f}. Omit to hold this arm.')
+        gripper_schema = {
+            'type': 'string',
+            'enum': ['open', 'close', 'hold'],
+        }
+        return [{
+            'type':
+            'function',
+            'name':
+            'move_joints',
+            'description':
+            ('Apply a small relative joint correction and optional '
+             'gripper command. Omitted arms and hold grippers keep their '
+             'current positions. The controller enforces joint limits '
+             'and interpolates the result into a smooth trajectory.'),
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'targets': {
+                        'type': 'object',
+                        'properties': {
+                            'left_joint_delta': {
+                                'type': 'array',
+                                'items': {
+                                    'type': 'number',
+                                    'minimum': -self.aloha_max_joint_delta,
+                                    'maximum': self.aloha_max_joint_delta,
+                                },
+                                'minItems': 6,
+                                'maxItems': 6,
+                                'description': delta_description,
+                            },
+                            'right_joint_delta': {
+                                'type': 'array',
+                                'items': {
+                                    'type': 'number',
+                                    'minimum': -self.aloha_max_joint_delta,
+                                    'maximum': self.aloha_max_joint_delta,
+                                },
+                                'minItems': 6,
+                                'maxItems': 6,
+                                'description': delta_description,
+                            },
+                            'left_gripper': gripper_schema,
+                            'right_gripper': gripper_schema,
+                        },
+                        'additionalProperties': False,
+                    },
+                    'note': {
+                        'type':
+                        'string',
+                        'description':
+                        ('One or two sentences describing the observed '
+                         'motion effect and why this correction is safe.'),
+                    },
+                },
+                'required': ['targets', 'note'],
+                'additionalProperties': False,
+            },
+            'strict':
+            False,
         }]
 
     def forward(self, *args, **kwargs):
@@ -289,13 +426,10 @@ class OpenAIResponsesVLA(nn.Module):
                              images: Sequence[Any],
                              image_names: Sequence[str],
                              task_description: str,
-                             eef_position: Any,
-                             eef_quaternion: Any,
-                             gripper_position: Any,
+                             eef_position: Any = None,
+                             eef_quaternion: Any = None,
+                             gripper_position: Any = None,
                              joint_position: Any = None) -> Dict[str, Any]:
-        position = self._unbatch_array(eef_position).reshape(-1)
-        quaternion = self._unbatch_array(eef_quaternion).reshape(-1)
-        gripper = self._unbatch_array(gripper_position).reshape(-1)
         lines = [
             'Current observation.',
             f'Instruction: {task_description}',
@@ -303,17 +437,34 @@ class OpenAIResponsesVLA(nn.Module):
              'Use the call budget efficiently: identify the target by call '
              '10, aim to grasp by call 25, and release it at the destination '
              'by call 45.'),
-            'robot0_eef_pos (x, y, z meters): ' +
-            np.array2string(position, precision=5, separator=', '),
-            'robot0_eef_quat (x, y, z, w): ' +
-            np.array2string(quaternion, precision=5, separator=', '),
-            'robot0_gripper_qpos: ' +
-            np.array2string(gripper, precision=5, separator=', '),
         ]
+        if eef_position is not None:
+            position = self._unbatch_array(eef_position).reshape(-1)
+            lines.append(
+                'robot0_eef_pos (x, y, z meters): ' +
+                np.array2string(position, precision=5, separator=', '))
+        if eef_quaternion is not None:
+            quaternion = self._unbatch_array(eef_quaternion).reshape(-1)
+            lines.append(
+                'robot0_eef_quat (x, y, z, w): ' +
+                np.array2string(quaternion, precision=5, separator=', '))
+        if gripper_position is not None:
+            gripper = self._unbatch_array(gripper_position).reshape(-1)
+            lines.append('robot0_gripper_qpos: ' +
+                         np.array2string(gripper, precision=5, separator=', '))
         if joint_position is not None:
             joints = self._unbatch_array(joint_position).reshape(-1)
-            lines.append('robot0_joint_pos: ' +
-                         np.array2string(joints, precision=5, separator=', '))
+            if self.control_mode == _ALOHA_CONTROL_MODE and joints.size >= 14:
+                lines.extend([
+                    'left_arm_joint_pos [j1..j6, gripper]: ' +
+                    np.array2string(joints[:7], precision=5, separator=', '),
+                    'right_arm_joint_pos [j1..j6, gripper]: ' +
+                    np.array2string(joints[7:14], precision=5, separator=', '),
+                ])
+            else:
+                lines.append(
+                    'robot0_joint_pos: ' +
+                    np.array2string(joints, precision=5, separator=', '))
 
         content: List[Dict[str, Any]] = [{
             'type': 'input_text',
@@ -411,24 +562,25 @@ class OpenAIResponsesVLA(nn.Module):
         raise AssertionError('unreachable')
 
     @staticmethod
-    def _function_call(response: Dict[str, Any]) -> Dict[str, Any]:
+    def _function_call(response: Dict[str, Any],
+                       tool_name: str) -> Dict[str, Any]:
         calls = [
             item for item in response.get('output', [])
             if item.get('type') == 'function_call'
-            and item.get('name') == 'move_to'
+            and item.get('name') == tool_name
         ]
         if len(calls) != 1:
             output_types = [
                 item.get('type') for item in response.get('output', [])
             ]
             raise RuntimeError(
-                'Expected exactly one move_to tool call from the OpenAI '
+                f'Expected exactly one {tool_name} tool call from the OpenAI '
                 f'Responses API, got {len(calls)}; output types={output_types}'
             )
         return calls[0]
 
-    def _actions_from_targets(self, targets: Dict[str, Any],
-                              eef_position: Any) -> torch.Tensor:
+    def _libero_actions_from_targets(self, targets: Dict[str, Any],
+                                     eef_position: Any) -> torch.Tensor:
         current = self._unbatch_array(eef_position).astype(
             np.float64).reshape(-1)[:3]
         target = current.copy()
@@ -463,7 +615,79 @@ class OpenAIResponsesVLA(nn.Module):
         actions = np.repeat(action[None], num_steps, axis=0)
         return torch.from_numpy(actions.astype(np.float32)).unsqueeze(0)
 
-    def _hold_actions(self) -> torch.Tensor:
+    def _aloha_actions_from_targets(self, targets: Dict[str, Any],
+                                    joint_position: Any) -> torch.Tensor:
+        """Convert bounded relative joint targets to an absolute trajectory."""
+        allowed_targets = {
+            'left_joint_delta', 'right_joint_delta', 'left_gripper',
+            'right_gripper'
+        }
+        unexpected_targets = set(targets) - allowed_targets
+        if unexpected_targets:
+            raise ValueError(
+                f'Unsupported ALOHA targets: {sorted(unexpected_targets)}')
+        current = self._unbatch_array(joint_position).astype(
+            np.float64).reshape(-1)
+        if current.size != 14:
+            raise ValueError(
+                f'ALOHA joint_position must contain 14 values, got '
+                f'{current.size}')
+        if not np.all(np.isfinite(current)):
+            raise ValueError('ALOHA joint_position contains NaN or Inf')
+
+        target = current.copy()
+        arm_specs = (
+            ('left_joint_delta', 'left_gripper', 0, 0),
+            ('right_joint_delta', 'right_gripper', 7, 6),
+        )
+        for delta_key, gripper_key, action_offset, limit_offset in arm_specs:
+            if delta_key in targets:
+                delta = np.asarray(targets[delta_key], dtype=np.float64)
+                if delta.shape != (6, ) or not np.all(np.isfinite(delta)):
+                    raise ValueError(
+                        f'{delta_key} must contain six finite values')
+                delta = np.clip(delta, -self.aloha_max_joint_delta,
+                                self.aloha_max_joint_delta)
+                for local_index in range(6):
+                    action_index = action_offset + local_index
+                    bounds = self.aloha_joint_limits[limit_offset +
+                                                     local_index]
+                    target[action_index] = np.clip(
+                        current[action_index] + delta[local_index], *bounds)
+
+            gripper_command = targets.get(gripper_key, 'hold')
+            gripper_index = action_offset + 6
+            if gripper_command == 'open':
+                target[gripper_index] = self.aloha_gripper_open
+            elif gripper_command == 'close':
+                target[gripper_index] = self.aloha_gripper_closed
+            elif gripper_command != 'hold':
+                raise ValueError(f'{gripper_key} must be open, close, or hold')
+
+        fractions = np.linspace(
+            1.0 / self.action_horizon,
+            1.0,
+            self.action_horizon,
+            dtype=np.float64)
+        # (14,) -> (T, 14); ALOHA consumes absolute joint targets.
+        actions = current[None] + fractions[:, None] * (target - current)[None]
+        return torch.from_numpy(actions.astype(np.float32))
+
+    def _actions_from_targets(self, targets: Dict[str, Any], eef_position: Any,
+                              joint_position: Any) -> torch.Tensor:
+        if self.control_mode == _ALOHA_CONTROL_MODE:
+            return self._aloha_actions_from_targets(targets, joint_position)
+        return self._libero_actions_from_targets(targets, eef_position)
+
+    def _hold_actions(self, joint_position: Any = None) -> torch.Tensor:
+        if self.control_mode == _ALOHA_CONTROL_MODE:
+            current = self._unbatch_array(joint_position).astype(
+                np.float32).reshape(-1)
+            if current.size != 14:
+                raise ValueError(
+                    'ALOHA hold action requires a 14-dimensional joint state')
+            return torch.from_numpy(
+                np.repeat(current[None], self.action_horizon, axis=0))
         action = np.array([0, 0, 0, 0, 0, 0, self._last_gripper_action],
                           dtype=np.float32)
         actions = np.repeat(action[None], self.action_horizon, axis=0)
@@ -473,9 +697,9 @@ class OpenAIResponsesVLA(nn.Module):
     def predict_action(self,
                        images: Sequence[Any],
                        task_description: str,
-                       eef_position: Any,
-                       eef_quaternion: Any,
-                       gripper_position: Any,
+                       eef_position: Any = None,
+                       eef_quaternion: Any = None,
+                       gripper_position: Any = None,
                        image_names: Sequence[str] = None,
                        joint_position: Any = None,
                        reset_history: bool = False,
@@ -497,7 +721,7 @@ class OpenAIResponsesVLA(nn.Module):
                     f'OpenAI call budget ({self.max_llm_calls}) exhausted; '
                     'returning hold actions for the rest of the episode.')
                 self._budget_warning_emitted = True
-            return self._hold_actions()
+            return self._hold_actions(joint_position)
 
         self._history.append(
             self._observation_message(images, image_names, task_description,
@@ -508,16 +732,17 @@ class OpenAIResponsesVLA(nn.Module):
         response = self._post_json(self._request_body())
         latency = time.monotonic() - start
         self._llm_calls += 1
-        call = self._function_call(response)
+        call = self._function_call(response, self.tool_name)
         try:
             arguments = json.loads(call.get('arguments', '{}'))
         except json.JSONDecodeError as exc:
             raise RuntimeError(
-                f'Invalid move_to arguments: {call.get("arguments")!r}') \
+                f'Invalid {self.tool_name} arguments: '
+                f'{call.get("arguments")!r}') \
                 from exc
         targets = arguments.get('targets', {})
         if not isinstance(targets, dict):
-            raise RuntimeError('move_to.targets must be an object')
+            raise RuntimeError(f'{self.tool_name}.targets must be an object')
         self.last_note = str(arguments.get('note', ''))
         usage = response.get('usage') or {}
         self.last_response_metadata = {
@@ -534,16 +759,18 @@ class OpenAIResponsesVLA(nn.Module):
         self._history.append({
             'type': 'function_call',
             'call_id': call_id,
-            'name': 'move_to',
+            'name': self.tool_name,
             'arguments': call.get('arguments', '{}'),
         })
-        actions = self._actions_from_targets(targets, eef_position)
+        actions = self._actions_from_targets(targets, eef_position,
+                                             joint_position)
         self._history.append({
             'type':
             'function_call_output',
             'call_id':
             call_id,
             'output':
-            f'executing move_to over {actions.shape[1]} steps',
+            f'executing {self.tool_name} over '
+            f'{actions.shape[-2]} steps',
         })
         return actions
